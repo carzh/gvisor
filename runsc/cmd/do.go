@@ -253,8 +253,12 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommand
 	if conf.Network == config.NetworkNone {
 		addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
 	} else if conf.Rootless {
-		if conf.Network == config.NetworkSandbox {
-			c.notifyUser("*** Warning: sandbox network isn't supported with --rootless, switching to host ***")
+		if conf.UsePasst(os.Geteuid()) {
+			// passt and netgofer give the sandbox its network. The sandbox
+			// gets a new, empty network namespace.
+			addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+		} else if conf.Network == config.NetworkSandbox {
+			c.notifyUser("*** Warning: sandbox network with --rootless needs passt (https://passt.top) at %s or --passt-binary, switching to host ***", config.DefaultPasstBinary)
 			conf.Network = config.NetworkHost
 		}
 	} else {

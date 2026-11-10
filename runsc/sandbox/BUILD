@@ -12,6 +12,7 @@ go_library(
         "network.go",
         "network_unsafe.go",
         "no_xdp.go",
+        "passt.go",
         "sandbox.go",
         "xdp.go",
     ],
@@ -71,6 +72,7 @@ go_test(
     srcs = [
         "metrics_test.go",
         "network_test.go",
+        "passt_test.go",
         "sandbox_test.go",
     ],
     embed = [":sandbox"],
@@ -81,6 +83,7 @@ go_test(
         "//runsc/boot/sentryapi",
         "//runsc/cgroup",
         "//runsc/config",
+        "//runsc/gofer/net",
         "//runsc/specutils",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@com_github_vishvananda_netlink//:go_default_library",

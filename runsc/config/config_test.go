@@ -16,6 +16,8 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -523,6 +525,37 @@ func TestValidationFail(t *testing.T) {
 			},
 			error: "netgofer and network-proxy-path flags cannot both be set",
 		},
+		{
+			name: "passt-binary:relative",
+			flags: map[string]string{
+				"passt-binary": "passt",
+			},
+			error: "passt-binary must be an absolute path",
+		},
+		{
+			name: "passt-binary+netgofer",
+			flags: map[string]string{
+				"passt-binary": "/usr/bin/passt",
+				"netgofer":     "proxy",
+			},
+			error: "passt-binary and netgofer flags cannot both be set",
+		},
+		{
+			name: "passt-binary+network-proxy-path",
+			flags: map[string]string{
+				"passt-binary":       "/usr/bin/passt",
+				"network-proxy-path": "/run/netproxy.sock",
+			},
+			error: "passt-binary and network-proxy-path flags cannot both be set",
+		},
+		{
+			name: "passt-binary+xdp",
+			flags: map[string]string{
+				"passt-binary":     "/usr/bin/passt",
+				"EXPERIMENTAL-xdp": "ns",
+			},
+			error: "passt-binary flag is incompatible with XDP",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -536,6 +569,63 @@ func TestValidationFail(t *testing.T) {
 				t.Errorf("NewFromFlags() wrong error reported: %v", err)
 			}
 		})
+	}
+}
+
+func TestUsePasst(t *testing.T) {
+	const passt = "/opt/passt/bin/passt"
+	existing := filepath.Join(t.TempDir(), "passt")
+	if err := os.WriteFile(existing, nil, 0755); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", existing, err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing-passt")
+	for _, tc := range []struct {
+		name     string
+		binary   string
+		def      string
+		network  NetworkType
+		rootless bool
+		euid     int
+		want     bool
+		wantPath string
+	}{
+		{name: "implicit rootless", binary: passt, def: missing, network: NetworkSandbox, euid: 1000, want: true, wantPath: passt},
+		{name: "--rootless", binary: passt, def: missing, network: NetworkSandbox, rootless: true, euid: 0, want: true, wantPath: passt},
+		{name: "root", binary: passt, def: existing, network: NetworkSandbox, euid: 0, want: false, wantPath: passt},
+		{name: "default exists", def: existing, network: NetworkSandbox, euid: 1000, want: true, wantPath: existing},
+		{name: "default missing", def: missing, network: NetworkSandbox, rootless: true, euid: 1000, want: false},
+		{name: "flag over default", binary: passt, def: existing, network: NetworkSandbox, euid: 1000, want: true, wantPath: passt},
+		{name: "network host", binary: passt, def: existing, network: NetworkHost, euid: 1000, want: false, wantPath: passt},
+		{name: "network none", def: existing, network: NetworkNone, rootless: true, want: false, wantPath: existing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := defaultPasstBinary
+			defaultPasstBinary = tc.def
+			t.Cleanup(func() { defaultPasstBinary = old })
+
+			c := &Config{PasstBinary: tc.binary, Network: tc.network, Rootless: tc.rootless}
+			if got := c.UsePasst(tc.euid); got != tc.want {
+				t.Errorf("UsePasst(%d) = %t, want %t", tc.euid, got, tc.want)
+			}
+			if got := c.PasstBinaryPath(); got != tc.wantPath {
+				t.Errorf("PasstBinaryPath() = %q, want %q", got, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestPasstBinaryValid(t *testing.T) {
+	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(testFlags)
+	if err := testFlags.Lookup("passt-binary").Value.Set("/usr/bin/passt"); err != nil {
+		t.Fatalf("Flag set: %v", err)
+	}
+	c, err := NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatalf("NewFromFlags() failed: %v", err)
+	}
+	if want := "/usr/bin/passt"; c.PasstBinary != want {
+		t.Errorf("PasstBinary = %q, want %q", c.PasstBinary, want)
 	}
 }
 

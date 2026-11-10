@@ -20,6 +20,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -193,6 +194,13 @@ type Config struct {
 	// sentry attaches its primary network interface to instead of creating
 	// an AF_PACKET socket.
 	NetworkProxyPath string `flag:"network-proxy-path"`
+
+	// PasstBinary is the absolute path of the passt binary
+	// (https://passt.top). In rootless mode with sandbox networking, runsc
+	// starts passt and netgofer (in passt mode) to give the sandbox network
+	// access. If empty, runsc uses DefaultPasstBinary if it exists. See
+	// PasstBinaryPath and UsePasst.
+	PasstBinary string `flag:"passt-binary"`
 
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
@@ -539,6 +547,40 @@ func (c *Config) UseNetworkProxy() bool {
 	return c.Netgofer.Enabled() || c.NetworkProxyPath != ""
 }
 
+// DefaultPasstBinary is the passt binary that runsc uses when --passt-binary
+// is not set. Distribution packages of passt install it here.
+const DefaultPasstBinary = "/usr/bin/passt"
+
+// defaultPasstBinary is DefaultPasstBinary. Tests can change it.
+var defaultPasstBinary = DefaultPasstBinary
+
+// PasstBinaryPath returns the passt binary to use: --passt-binary if it is
+// set, else DefaultPasstBinary if that file exists, else "".
+func (c *Config) PasstBinaryPath() string {
+	if c.PasstBinary != "" {
+		return c.PasstBinary
+	}
+	if _, err := os.Stat(defaultPasstBinary); err == nil {
+		return defaultPasstBinary
+	}
+	return ""
+}
+
+// RootlessSandboxNetwork reports whether the network type is "sandbox" and
+// runsc runs rootless: with --rootless, or with a non-root effective user ID.
+// euid is the effective user ID of runsc.
+func (c *Config) RootlessSandboxNetwork(euid int) bool {
+	return c.Network == NetworkSandbox && (c.Rootless || euid != 0)
+}
+
+// UsePasst reports whether runsc gives the sandbox network access through
+// netgofer and passt: in rootless mode with sandbox networking (see
+// RootlessSandboxNetwork), when a passt binary is available (see
+// PasstBinaryPath).
+func (c *Config) UsePasst(euid int) bool {
+	return c.RootlessSandboxNetwork(euid) && c.PasstBinaryPath() != ""
+}
+
 // platformDevicePaths is the parsed value of --platform_device_path.
 type platformDevicePaths struct {
 	// any is the device file path for every platform. The single-path form
@@ -631,6 +673,20 @@ func (c *Config) Validate() error {
 		}
 		if c.XDP.Mode != XDPModeOff {
 			return fmt.Errorf("netgofer flag is incompatible with XDP")
+		}
+	}
+	if c.PasstBinary != "" {
+		if !filepath.IsAbs(c.PasstBinary) {
+			return fmt.Errorf("passt-binary must be an absolute path, got %q", c.PasstBinary)
+		}
+		if c.Netgofer.Enabled() {
+			return fmt.Errorf("passt-binary and netgofer flags cannot both be set")
+		}
+		if c.NetworkProxyPath != "" {
+			return fmt.Errorf("passt-binary and network-proxy-path flags cannot both be set")
+		}
+		if c.XDP.Mode != XDPModeOff {
+			return fmt.Errorf("passt-binary flag is incompatible with XDP")
 		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
