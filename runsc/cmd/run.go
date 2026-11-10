@@ -101,8 +101,11 @@ func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
 	waitStatus := args[1].(*unix.WaitStatus)
 
 	if conf.Rootless {
-		if conf.Network == config.NetworkSandbox {
-			return util.Errorf("sandbox network isn't supported with --rootless, use --network=none or --network=host")
+		if conf.Network == config.NetworkSandbox && !conf.UsePasst(os.Geteuid()) {
+			if conf.UseNetworkProxy() || conf.XDP.Mode != config.XDPModeOff {
+				return util.Errorf("sandbox network with --rootless requires passt (https://passt.top) and is incompatible with --netgofer, --network-proxy-path, and XDP")
+			}
+			return util.Errorf("sandbox network with --rootless needs passt (https://passt.top): install it at %s, or set --passt-binary, or use --network=none or --network=host", config.DefaultPasstBinary)
 		}
 
 		if err := specutils.MaybeRunAsRoot(); err != nil {

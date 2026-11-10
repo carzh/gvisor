@@ -253,10 +253,12 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommand
 	if conf.Network == config.NetworkNone {
 		addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
 	} else if conf.Rootless {
-		if conf.Network == config.NetworkSandbox {
-			c.notifyUser("*** Warning: sandbox network isn't supported with --rootless, switching to host ***")
-			conf.Network = config.NetworkHost
+		hostResolv, _ := os.ReadFile("/etc/resolv.conf")
+		clean, err := c.setupRootlessNet(conf, os.Geteuid(), spec, string(hostResolv))
+		if err != nil {
+			return util.Errorf("Error setting up rootless network: %v", err)
 		}
+		defer clean()
 	} else {
 		switch clean, err := c.setupNet(cid, spec); err {
 		case errNoDefaultInterface:
@@ -281,6 +283,70 @@ func addNamespace(spec *specs.Spec, ns specs.LinuxNamespace) {
 		spec.Linux = &specs.Linux{}
 	}
 	spec.Linux.Namespaces = append(spec.Linux.Namespaces, ns)
+}
+
+// setupRootlessNet configures networking for "runsc --rootless do" when
+// conf.Network is not NetworkNone. It returns a cleanup function for any
+// temporary files mounted into spec.
+func (c *Do) setupRootlessNet(conf *config.Config, euid int, spec *specs.Spec, hostResolvConf string) (func(), error) {
+	if conf.UsePasst(euid) {
+		c.notifyUser("*** Using passt (%s) for rootless sandbox networking ***", conf.PasstBinaryPath())
+		// passt and netgofer give the sandbox its network. The sandbox
+		// gets a new, empty network namespace.
+		addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+		resolvPath, err := makeFile("/etc/resolv.conf", passtResolvConf(hostResolvConf), spec)
+		if err != nil {
+			return nil, err
+		}
+		return func() { tryRemove(resolvPath) }, nil
+	}
+	if conf.Network == config.NetworkSandbox {
+		if conf.UseNetworkProxy() || conf.XDP.Mode != config.XDPModeOff {
+			c.notifyUser("*** Warning: sandbox network with --rootless requires passt and is incompatible with --netgofer, --network-proxy-path, and XDP, switching to host ***")
+		} else {
+			c.notifyUser("*** Warning: sandbox network with --rootless needs passt (https://passt.top) at %s or --passt-binary, switching to host ***", config.DefaultPasstBinary)
+		}
+		conf.Network = config.NetworkHost
+	}
+	return func() {}, nil
+}
+
+// passtResolvConf returns /etc/resolv.conf contents for a rootless passt
+// sandbox. It keeps non-loopback IPv4 nameservers from hostResolvConf (plus
+// search and options lines), or falls back to 8.8.8.8 when the host only
+// configures loopback or IPv6 resolvers that are unreachable in passt mode.
+func passtResolvConf(hostResolvConf string) string {
+	var nameservers []string
+	var extras []string
+	for _, line := range strings.Split(hostResolvConf, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		switch fields[0] {
+		case "nameserver":
+			if len(fields) < 2 {
+				continue
+			}
+			ip := net.ParseIP(fields[1])
+			if ip == nil {
+				continue
+			}
+			ip4 := ip.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() || ip4.IsUnspecified() {
+				continue
+			}
+			nameservers = append(nameservers, "nameserver "+ip4.String())
+		case "search", "options":
+			extras = append(extras, trimmed)
+		}
+	}
+	if len(nameservers) == 0 {
+		nameservers = []string{"nameserver 8.8.8.8"}
+	}
+	lines := append(nameservers, extras...)
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func (c *Do) notifyUser(format string, v ...any) {
