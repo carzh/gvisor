@@ -238,11 +238,23 @@ type Sandbox struct {
 	// Args.NoRootContainer.
 	NoRootContainer bool `json:"noRootContainer"`
 
+	// PasstBinary is the resolved passt binary path selected for this sandbox, or
+	// empty when passt mode is not active. Persisting it keeps create and start
+	// consistent.
+	PasstBinary string `json:"passtBinary,omitempty"`
+
+	// PasstResolved reports whether PasstBinary was evaluated for this sandbox.
+	PasstResolved bool `json:"passtResolved,omitempty"`
+
 	// rootDir is the same as config.Config.RootDir. It represents the runtime
 	// root directory being used by the current runsc invocation. It's not saved
 	// to json, because the RootDir can change across runsc invocations.
 	// Depending on the caller's mount namespace, the path can vary.
 	rootDir string `nojson:"true"`
+
+	// attached is set when the sandbox runs in attached foreground mode in the
+	// current runsc process.
+	attached bool `nojson:"true"`
 
 	// child is set if a sandbox process is a child of the current process.
 	//
@@ -404,6 +416,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		StartTime:           starttime.Get(),
 		NoRootContainer:     args.NoRootContainer,
 		Creating:            args.NoRootContainer && args.CPULimits != nil,
+		attached:            args.Attached,
 	}
 	if args.Spec != nil && args.Spec.Annotations != nil {
 		s.PodName = args.Spec.Annotations[podNameAnnotation]
@@ -676,6 +689,12 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	}
 	defer conn.Close()
 
+	// Keep the passt mode chosen when the sandbox process was created: the
+	// sandbox network namespace depends on it. Older state files lack it.
+	if !s.PasstResolved {
+		s.PasstBinary = resolveSandboxPasstBinary(conf, unix.Geteuid())
+		s.PasstResolved = true
+	}
 	if networkArgs == nil {
 		var disableIPv6 bool
 		disableIPv6, err = getDisableIPv6(spec)
@@ -690,7 +709,10 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	} else {
 		if conf.Netgofer.Enabled() {
 			log.Warningf("Netgofer proxy is enabled (--netgofer=%s) but custom network args are provided for restore; netgofer will not be started", conf.Netgofer)
+		} else if s.PasstBinary != "" {
+			log.Warningf("Passt mode is enabled (%q) but custom network args are provided for restore; passt and netgofer will not be started", s.PasstBinary)
 		}
+		s.stopNetgofer()
 		// When network args is not nil, set it in the loader which will be used
 		// during restore to configure the loaded stack.
 		log.Debugf("Setting up network args, config: %+v", networkArgs)
@@ -1367,17 +1389,23 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 		cmd.Args = append(cmd.Args, "--nvidia-driver-version="+args.NvidiaDriverVersion)
 	}
 
-	// Joins the network namespace if network is enabled. the sandbox talks
+	euid := unix.Geteuid()
+	s.PasstBinary = resolveSandboxPasstBinary(conf, euid)
+	s.PasstResolved = true
+
+	// Joins the network namespace if network is enabled. The sandbox talks
 	// directly to the host network, which may have been configured in the
+	// namespace. In passt mode, the sandbox always uses a new empty network
 	// namespace.
-	if ns, ok := specutils.GetNS(specs.NetworkNamespace, args.Spec); ok && conf.Network != config.NetworkNone {
-		log.Infof("Sandbox will be started in the container's network namespace: %+v", ns)
+	if ns, ok := sandboxNetworkNamespace(conf, args.Spec, s.PasstBinary != ""); ok {
+		if ns.Path != "" {
+			log.Infof("Sandbox will be started in the container's network namespace: %+v", ns)
+		} else {
+			log.Infof("Sandbox will be started in new network namespace")
+		}
 		nss = append(nss, ns)
-	} else if conf.Network == config.NetworkHost {
-		log.Infof("Sandbox will be started in the host network namespace")
 	} else {
-		log.Infof("Sandbox will be started in new network namespace")
-		nss = append(nss, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+		log.Infof("Sandbox will be started in the host network namespace")
 	}
 
 	// These are set to the uid/gid that the sandbox process will use. May be
@@ -1389,7 +1417,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	// filesystem is required. These features require to run inside the user
 	// namespace specified in the spec or the current namespace if none is
 	// configured.
-	rootlessEUID := unix.Geteuid() != 0
+	rootlessEUID := euid != 0
 	setUserMappings := false
 	if conf.Network == config.NetworkHost || conf.DirectFS {
 		if userns, ok := specutils.GetNS(specs.UserNamespace, args.Spec); ok {

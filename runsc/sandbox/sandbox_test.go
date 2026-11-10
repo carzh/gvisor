@@ -686,3 +686,84 @@ func TestSentryGODEBUG(t *testing.T) {
 		})
 	}
 }
+
+func TestSandboxNetworkNamespace(t *testing.T) {
+	specWithPath := &specs.Spec{
+		Linux: &specs.Linux{
+			Namespaces: []specs.LinuxNamespace{{Type: specs.NetworkNamespace, Path: "/var/run/netns/cni0"}},
+		},
+	}
+	for _, tc := range []struct {
+		name     string
+		conf     config.Config
+		spec     *specs.Spec
+		usePasst bool
+		wantNS   specs.LinuxNamespace
+		wantOK   bool
+	}{
+		{
+			name:     "passt ignores spec network namespace path",
+			conf:     config.Config{Network: config.NetworkSandbox},
+			spec:     specWithPath,
+			usePasst: true,
+			wantNS:   specs.LinuxNamespace{Type: specs.NetworkNamespace},
+			wantOK:   true,
+		},
+		{
+			name:     "rootful sandbox joins spec network namespace path",
+			conf:     config.Config{Network: config.NetworkSandbox},
+			spec:     specWithPath,
+			usePasst: false,
+			wantNS:   specs.LinuxNamespace{Type: specs.NetworkNamespace, Path: "/var/run/netns/cni0"},
+			wantOK:   true,
+		},
+		{
+			name:   "network none creates empty network namespace",
+			conf:   config.Config{Network: config.NetworkNone},
+			spec:   specWithPath,
+			wantNS: specs.LinuxNamespace{Type: specs.NetworkNamespace},
+			wantOK: true,
+		},
+		{
+			name:   "network host with spec path joins spec path",
+			conf:   config.Config{Network: config.NetworkHost},
+			spec:   specWithPath,
+			wantNS: specs.LinuxNamespace{Type: specs.NetworkNamespace, Path: "/var/run/netns/cni0"},
+			wantOK: true,
+		},
+		{
+			name:   "network host without spec namespace uses host netns",
+			conf:   config.Config{Network: config.NetworkHost},
+			spec:   &specs.Spec{},
+			wantOK: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotNS, gotOK := sandboxNetworkNamespace(&tc.conf, tc.spec, tc.usePasst)
+			if gotOK != tc.wantOK || gotNS != tc.wantNS {
+				t.Errorf("sandboxNetworkNamespace() = (%+v, %t), want (%+v, %t)", gotNS, gotOK, tc.wantNS, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestResolveSandboxPasstBinaryWithCaps(t *testing.T) {
+	conf := &config.Config{
+		Network:     config.NetworkSandbox,
+		PasstBinary: "/usr/bin/passt",
+	}
+	if got := resolveSandboxPasstBinaryWithCaps(conf, 1000, func() bool { return false }); got != "/usr/bin/passt" {
+		t.Errorf("unprivileged non-root got %q, want /usr/bin/passt", got)
+	}
+	if got := resolveSandboxPasstBinaryWithCaps(conf, 1000, func() bool { return true }); got != "" {
+		t.Errorf("capability-bearing non-root got %q, want empty", got)
+	}
+	confRootless := &config.Config{
+		Rootless:    true,
+		Network:     config.NetworkSandbox,
+		PasstBinary: "/usr/bin/passt",
+	}
+	if got := resolveSandboxPasstBinaryWithCaps(confRootless, 1000, func() bool { return true }); got != "/usr/bin/passt" {
+		t.Errorf("explicit --rootless got %q, want /usr/bin/passt", got)
+	}
+}

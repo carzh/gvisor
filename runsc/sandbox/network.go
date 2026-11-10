@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
@@ -63,17 +64,38 @@ import (
 func (s *Sandbox) setupNetwork(conn *urpc.Client, pid int, spec *specs.Spec, conf *config.Config, disableIPv6 bool, isRestore bool) error {
 	log.Infof("Setting up network")
 
+	// createSandboxProcess saves the passt mode. Only sandboxes created by an
+	// older runsc have no saved mode.
+	if !s.PasstResolved {
+		euid := 0
+		if conf.Network == config.NetworkSandbox && !conf.Rootless {
+			euid = unix.Geteuid()
+		}
+		s.PasstBinary = resolveSandboxPasstBinary(conf, euid)
+		s.PasstResolved = true
+	}
+	passtBinary := s.PasstBinary
+	usePasst := passtBinary != ""
+	unprivilegedSandboxNet := !usePasst && conf.Network == config.NetworkSandbox && (conf.Rootless || (unix.Geteuid() != 0 && !specutils.HasCapabilities(capability.CAP_SYS_ADMIN)))
+	if conf.PasstBinary != "" && !usePasst {
+		log.Warningf("Ignoring --passt-binary: the sandbox was created without passt networking, which requires rootless mode (--rootless or an unprivileged non-root user) with --network=sandbox")
+	} else if unprivilegedSandboxNet && !conf.UseNetworkProxy() && conf.XDP.Mode == config.XDPModeOff {
+		log.Warningf("passt not found at %q and --passt-binary is not set: rootless sandbox networking requires passt (https://passt.top)", config.DefaultPasstBinary)
+	}
+	useNetgofer := conf.Network == config.NetworkSandbox && (conf.Netgofer.Enabled() || usePasst)
+
 	var (
 		udsHost    *os.File
 		udsSandbox *os.File
 	)
-	if conf.Netgofer.Enabled() && conf.Network == config.NetworkSandbox {
+	if useNetgofer {
 		fds, sockErr := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
 		if sockErr != nil {
 			return fmt.Errorf("creating socket pair: %w", sockErr)
 		}
+		tryForce := !usePasst && !conf.Rootless
 		for _, fd := range fds {
-			setUDSBufSizes(fd)
+			setUDSBufSizes(fd, tryForce)
 		}
 		udsHost = os.NewFile(uintptr(fds[0]), "uds-host")
 		udsSandbox = os.NewFile(uintptr(fds[1]), "uds-sandbox")
@@ -89,6 +111,30 @@ func (s *Sandbox) setupNetwork(conn *urpc.Client, pid int, spec *specs.Spec, con
 			return fmt.Errorf("creating default loopback interface: %v", err)
 		}
 	case config.NetworkSandbox:
+		if usePasst {
+			if spec != nil {
+				if ns, ok := specutils.GetNS(specs.NetworkNamespace, spec); ok && ns.Path != "" {
+					log.Warningf("Ignoring network namespace path %q in OCI spec: passt mode uses the current network namespace for host traffic", ns.Path)
+				}
+			}
+			// A rootless runsc cannot join the sandbox network namespace, and
+			// that namespace is empty, so there is nothing to scrape.
+			var err error
+			primaryMTU, err = createPasstInterfacesAndRoutes(conn, conf, disableIPv6, isRestore, udsSandbox)
+			if err != nil {
+				return fmt.Errorf("creating passt network interfaces: %w", err)
+			}
+			break
+		}
+		if unprivilegedSandboxNet {
+			if conf.UseNetworkProxy() || conf.XDP.Mode != config.XDPModeOff {
+				return fmt.Errorf("rootless sandbox networking requires passt (https://passt.top) and is incompatible with --netgofer, --network-proxy-path, and XDP")
+			}
+			if conf.PasstBinary != "" {
+				return fmt.Errorf("rootless sandbox networking requires passt (https://passt.top), but the sandbox was created without passt networking")
+			}
+			return fmt.Errorf("rootless sandbox networking requires passt (https://passt.top): install it at %s, or set --passt-binary, or use --network=none or --network=host", config.DefaultPasstBinary)
+		}
 		// Build the path to the net namespace of the sandbox process.
 		// This is what we will copy.
 		nsPath := filepath.Join("/proc", strconv.Itoa(pid), "ns/net")
@@ -107,8 +153,8 @@ func (s *Sandbox) setupNetwork(conn *urpc.Client, pid int, spec *specs.Spec, con
 		return fmt.Errorf("invalid network type: %v", conf.Network)
 	}
 
-	if conf.Netgofer.Enabled() && conf.Network == config.NetworkSandbox {
-		if err := s.startProxy(conf, spec, udsHost, pid, primaryMTU); err != nil {
+	if useNetgofer {
+		if err := s.startProxy(conf, spec, udsHost, pid, primaryMTU, passtBinary); err != nil {
 			return fmt.Errorf("starting proxy: %w", err)
 		}
 	}
@@ -117,8 +163,8 @@ func (s *Sandbox) setupNetwork(conn *urpc.Client, pid int, spec *specs.Spec, con
 }
 
 const (
-	// defaultPrimaryInterfaceName is the default fallback primary interface used
-	// when the network-proxy-path is set.
+	// defaultPrimaryInterfaceName is the primary sandbox interface name when no
+	// host interface is scraped (for example in passt or network-proxy mode).
 	defaultPrimaryInterfaceName = "eth0"
 
 	// defaultMTU is the MTU assumed for a network link when none is otherwise
@@ -178,14 +224,14 @@ func primaryInterface(args *sentryapi.CreateLinksAndRoutesArgs) (string, error) 
 // setUDSBufSizes increases the send and receive buffers of a UDS network link
 // so that packet bursts are not dropped. Failures are not fatal, the socket
 // simply keeps the smaller default buffer.
-func setUDSBufSizes(fd int) {
+func setUDSBufSizes(fd int, tryForce bool) {
 	const bufSize = 4 << 20 // 4MB.
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, bufSize); err != nil {
+	if !tryForce || unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, bufSize) != nil {
 		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, bufSize); err != nil {
 			log.Warningf("Failed to set UDS receive buffer to %d: %v", bufSize, err)
 		}
 	}
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, bufSize); err != nil {
+	if !tryForce || unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, bufSize) != nil {
 		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, bufSize); err != nil {
 			log.Warningf("Failed to set UDS send buffer to %d: %v", bufSize, err)
 		}
@@ -228,12 +274,12 @@ func dialExternalUDS(path string) (*os.File, error) {
 	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO, &unix.Timeval{}); err != nil {
 		log.Warningf("Failed to clear SO_SNDTIMEO on UDS socket: %v", err)
 	}
-	setUDSBufSizes(fd)
+	setUDSBufSizes(fd, unix.Geteuid() == 0)
 	log.Infof("Attached sandbox network to external UDS peer %q", path)
 	return os.NewFile(uintptr(fd), "net-uds"), nil
 }
 
-// configureProxyLink configures link to operate over an external UDS proxy FD.
+// configureProxyLink configures link to operate over a UDS proxy FD.
 func configureProxyLink(link *sentryapi.FDBasedLink) {
 	link.IsProxy = true
 	if link.NumChannels != 1 {
@@ -671,8 +717,11 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 	return primaryMTU, nil
 }
 
-// startProxy spawns the netgofer proxy subprocess if netgofer is enabled.
-func (s *Sandbox) startProxy(conf *config.Config, spec *specs.Spec, udsHost *os.File, pid int, mtu int) error {
+// startProxy spawns the netgofer subprocess. If passtBinary is non-empty, it
+// also starts passt and runs netgofer in passt mode in the current network
+// namespace.
+func (s *Sandbox) startProxy(conf *config.Config, spec *specs.Spec, udsHost *os.File, pid int, mtu int, passtBinary string) error {
+	usePasst := passtBinary != ""
 	if udsHost == nil {
 		return fmt.Errorf("UDS proxy enabled but udsHost is nil")
 	}
@@ -696,16 +745,22 @@ func (s *Sandbox) startProxy(conf *config.Config, spec *specs.Spec, udsHost *os.
 	// has been started yet.
 	s.stopNetgofer()
 
-	netNS := fmt.Sprintf("/proc/%d/ns/net", pid)
-	if _, err := os.Stat(netNS); err != nil {
-		return fmt.Errorf("sandbox network namespace %q not found: %w", netNS, err)
+	// In passt mode, netgofer stays in the current network namespace: passt
+	// opens the host sockets, and a rootless runsc cannot join the sandbox
+	// network namespace.
+	var nss []specs.LinuxNamespace
+	if !usePasst {
+		netNS := fmt.Sprintf("/proc/%d/ns/net", pid)
+		if _, err := os.Stat(netNS); err != nil {
+			return fmt.Errorf("sandbox network namespace %q not found: %w", netNS, err)
+		}
+		nss = []specs.LinuxNamespace{{
+			Type: specs.NetworkNamespace,
+			Path: netNS,
+		}}
 	}
-	nss := []specs.LinuxNamespace{{
-		Type: specs.NetworkNamespace,
-		Path: netNS,
-	}}
 
-	// Ensure we don't leak FDs to the netgofer process.
+	// Ensure we don't leak FDs to the netgofer and passt processes.
 	if err := SetCloExeOnAllFDs(); err != nil {
 		return fmt.Errorf("setting CLOEXEC on all FDs: %w", err)
 	}
@@ -737,39 +792,61 @@ func (s *Sandbox) startProxy(conf *config.Config, spec *specs.Spec, udsHost *os.
 	}
 
 	cmd := exec.Command(binPath, conf.ToFlags()...)
+	cmd.Dir = "/"
 	cmd.Env = gvisorbinaries.WithEnforceRelease(slices.DeleteFunc(os.Environ(), func(env string) bool { return strings.HasPrefix(env, "GOMAXPROCS=") }))
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		Setsid: true,
+	}
+	if s.attached {
+		cmd.SysProcAttr.Pdeathsig = unix.SIGKILL
 	}
 	cmd.Args[0] = gvisorbinaries.Netgofer.Name
 
 	nextFD := donations.Transfer(cmd, 3)
 
 	cmd.Args = append(cmd.Args, "netgofer", fmt.Sprintf("--mtu=%d", mtu))
-	if conf.Netgofer.AllowLoopback() {
+	if !usePasst && conf.Netgofer.AllowLoopback() {
 		cmd.Args = append(cmd.Args, "--allow-loopback")
 	}
 	donations.Donate("uds-fd", udsHost)
 	if err := profile.DonateProfileFDs(conf, &donations, true /* isGofer */, lfOpts); err != nil {
 		return fmt.Errorf("donating netgofer profile fds: %w", err)
 	}
-	_ = donations.Transfer(cmd, nextFD)
-	cmd.Args = append(cmd.Args, s.ID)
 
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-
-	donation.LogDonations(cmd)
-	log.Debugf("Starting netgofer: %s %v", cmd.Path, cmd.Args)
-
+	var passtErr error
 	if err := cgroup.RunInCgroup(s.CgroupJSON.Cgroup, func(cloneIntoCgroupFD *os.File) error {
+		if usePasst {
+			passtSock, err := startPasst(passtBinary, cloneIntoCgroupFD)
+			if err != nil {
+				passtErr = err
+				return err
+			}
+			// netgofer gets a copy of passtSock. donations.Close() closes the runsc
+			// copy, so that passt sees EOF when netgofer exits.
+			donations.DonateAndClose("passt-fd", passtSock)
+		}
+		_ = donations.Transfer(cmd, nextFD)
+		cmd.Args = append(cmd.Args, s.ID)
+
+		cmd.Stdin = nil
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+
+		donation.LogDonations(cmd)
+		log.Debugf("Starting netgofer: %s %v", cmd.Path, cmd.Args)
+
 		if cloneIntoCgroupFD != nil {
 			cmd.SysProcAttr.UseCgroupFD = true
 			cmd.SysProcAttr.CgroupFD = int(cloneIntoCgroupFD.Fd())
 		}
+		if len(nss) == 0 {
+			return cmd.Start()
+		}
 		return specutils.StartInNS(cmd, nss)
 	}); err != nil {
+		if passtErr != nil {
+			return passtErr
+		}
 		return fmt.Errorf("failed to start UDS proxy %q: %w", binPath, err)
 	}
 	netgoferPid := cmd.Process.Pid

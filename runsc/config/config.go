@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -184,7 +185,8 @@ type Config struct {
 	// PCAP is a file to which network packets should be logged in PCAP format.
 	PCAP string `flag:"pcap-log"`
 
-	// Netgofer controls whether and how netgofer is used for networking via UDS.
+	// Netgofer controls whether and how netgofer is used for networking via UDS
+	// (except in passt mode; see UsePasst).
 	// Note: It is experimental and currently only proxies outbound TCP and UDP
 	// traffic. Active connections cannot be preserved across save/restore.
 	Netgofer NetgoferMode `flag:"netgofer"`
@@ -193,6 +195,13 @@ type Config struct {
 	// sentry attaches its primary network interface to instead of creating
 	// an AF_PACKET socket.
 	NetworkProxyPath string `flag:"network-proxy-path"`
+
+	// PasstBinary is the absolute path of the passt binary
+	// (https://passt.top). In rootless mode with sandbox networking, runsc
+	// starts passt and netgofer (in passt mode) for outbound IPv4 access. If
+	// empty, runsc uses DefaultPasstBinary when available. Active connections
+	// cannot be preserved across save/restore. See PasstBinaryPath and UsePasst.
+	PasstBinary string `flag:"passt-binary"`
 
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
@@ -533,10 +542,72 @@ type Config struct {
 	SharedRootDir string `flag:"shared-root"`
 }
 
-// UseNetworkProxy reports whether the primary sandbox network interface should
-// be attached to a unix domain socket instead of AF_PACKET socket.
+// UseNetworkProxy reports whether --netgofer or --network-proxy-path attaches
+// the primary sandbox network interface to a Unix domain socket instead of an
+// AF_PACKET socket. It does not include rootless passt mode (see UsePasst).
 func (c *Config) UseNetworkProxy() bool {
 	return c.Netgofer.Enabled() || c.NetworkProxyPath != ""
+}
+
+// DefaultPasstBinary is the passt binary that runsc uses when --passt-binary
+// is empty. Distribution packages of passt install it here.
+const DefaultPasstBinary = "/usr/bin/passt"
+
+// defaultPasstBinary is the fallback passt binary path when --passt-binary is
+// empty.
+var defaultPasstBinary = DefaultPasstBinary
+
+// OverrideDefaultPasstBinaryForTest overrides defaultPasstBinary for tests and
+// returns a function that restores the previous value.
+func OverrideDefaultPasstBinaryForTest(path string) func() {
+	old := defaultPasstBinary
+	defaultPasstBinary = path
+	return func() { defaultPasstBinary = old }
+}
+
+// PasstBinaryPath returns --passt-binary if set, else DefaultPasstBinary if it
+// is an executable regular file, else "".
+func (c *Config) PasstBinaryPath() string {
+	if c.PasstBinary != "" {
+		return c.PasstBinary
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(defaultPasstBinary, &st); err == nil && st.Mode&unix.S_IFMT == unix.S_IFREG && unix.Access(defaultPasstBinary, unix.X_OK) == nil {
+		return defaultPasstBinary
+	}
+	return ""
+}
+
+// rootlessSandboxNetwork reports whether the network type is "sandbox" and
+// runsc runs rootless (--rootless or a non-root effective user ID euid).
+func (c *Config) rootlessSandboxNetwork(euid int) bool {
+	return c.Network == NetworkSandbox && (c.Rootless || euid != 0)
+}
+
+// CanUsePasst reports whether c is eligible for rootless passt networking:
+// the network type is "sandbox", runsc runs rootless (--rootless or a non-root
+// effective user ID euid), and no other network proxy or XDP mode is set.
+//
+// CanUsePasst does not check capabilities. The sandbox package also keeps
+// namespace networking for a non-root caller without --rootless that holds
+// CAP_SYS_ADMIN.
+func (c *Config) CanUsePasst(euid int) bool {
+	return c.rootlessSandboxNetwork(euid) && !c.UseNetworkProxy() && c.XDP.Mode == XDPModeOff
+}
+
+// ResolvePasstBinary returns the passt binary path when c is eligible for
+// passt networking (see CanUsePasst), or "" otherwise.
+func (c *Config) ResolvePasstBinary(euid int) string {
+	if !c.CanUsePasst(euid) {
+		return ""
+	}
+	return c.PasstBinaryPath()
+}
+
+// UsePasst reports whether c is eligible for passt networking (see
+// CanUsePasst) and a passt binary is available (see PasstBinaryPath).
+func (c *Config) UsePasst(euid int) bool {
+	return c.ResolvePasstBinary(euid) != ""
 }
 
 // platformDevicePaths is the parsed value of --platform_device_path.
@@ -634,6 +705,20 @@ func (c *Config) Validate() error {
 		}
 		if c.XDP.Mode != XDPModeOff {
 			return fmt.Errorf("netgofer flag is incompatible with XDP")
+		}
+	}
+	if c.PasstBinary != "" {
+		if !filepath.IsAbs(c.PasstBinary) {
+			return fmt.Errorf("passt-binary must be an absolute path, got %q", c.PasstBinary)
+		}
+		if c.Netgofer.Enabled() {
+			return fmt.Errorf("passt-binary and netgofer flags cannot both be set")
+		}
+		if c.NetworkProxyPath != "" {
+			return fmt.Errorf("passt-binary and network-proxy-path flags cannot both be set")
+		}
+		if c.XDP.Mode != XDPModeOff {
+			return fmt.Errorf("passt-binary flag is incompatible with XDP")
 		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
@@ -2055,7 +2140,8 @@ func (p StateEnginePolicy) String() string {
 type NetgoferMode int
 
 const (
-	// NetgoferModeOff disables the netgofer UDS proxy.
+	// NetgoferModeOff disables the netgofer UDS proxy (except in passt mode;
+	// see UsePasst).
 	NetgoferModeOff NetgoferMode = iota
 
 	// NetgoferModeProxy runs netgofer in user-space Netstack TCP/UDP proxy mode.

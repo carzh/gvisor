@@ -48,8 +48,9 @@ standard "rootful" code paths.
 *   The `create` command is not supported. Using `runsc create` is the common
     case. The `--rootless` flag is mainly only suitable for `runsc do`.
 *   Save/restore functionality is not supported.
-*   gVisor's Netstack is not supported, meaning you have to use the host network
-    for external connectivity.
+*   Outbound IPv4 sandbox networking (Netstack) requires `passt`
+    (`/usr/bin/passt` or `--passt-binary`). Without `passt`, use
+    `--network=host` or `--network=none`.
 *   Configuration errors related to cgroups are ignored.
 
 ### Method 2: Caller-Configured Userns (Docker / Podman)
@@ -78,7 +79,10 @@ non-root user and explicitly specify the user namespace mappings within the OCI
 *   `runsc` has specific rootless code paths to handle this configuration.
 *   Like `rootlesskit`, `runsc` will attempt to invoke `SETUID` binaries like
     `newuidmap(1)` to set up the multi-user namespace mappings.
-*   This method currently lacks support for network namespacing.
+*   Outbound IPv4 sandbox networking (Netstack) requires `passt`
+    (`/usr/bin/passt` or `--passt-binary`) and ignores any network namespace
+    path in `config.json`. Without `passt`, use `--network=host` or
+    `--network=none`.
 
 ## Advanced: Running in Strict, Unprivileged Environments (No `setuid`)
 

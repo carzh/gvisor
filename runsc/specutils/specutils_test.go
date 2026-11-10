@@ -1464,3 +1464,101 @@ func TestApplyNSRestoresThreadNamespace(t *testing.T) {
 		t.Errorf("after restore, thread netns = %q, want %q (leader netns is %q)", restoredNS, threadNS, leaderNS)
 	}
 }
+
+func TestCreateMountPointFile(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("missing file is created without execute bits", func(t *testing.T) {
+		dst := dir + "/new"
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		fi, err := os.Lstat(dst)
+		if err != nil {
+			t.Fatalf("os.Lstat(%q) failed: %v", dst, err)
+		}
+		if !fi.Mode().IsRegular() || fi.Mode().Perm()&0111 != 0 {
+			t.Errorf("mode = %v, want a regular file without execute bits", fi.Mode())
+		}
+	})
+
+	t.Run("existing file is unchanged", func(t *testing.T) {
+		dst := dir + "/existing"
+		if err := os.WriteFile(dst, []byte("data"), 0444); err != nil {
+			t.Fatalf("os.WriteFile(%q) failed: %v", dst, err)
+		}
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		if got, err := os.ReadFile(dst); err != nil || string(got) != "data" {
+			t.Errorf("os.ReadFile(%q) = %q, %v, want \"data\"", dst, got, err)
+		}
+	})
+
+	t.Run("dangling symlink target is not created", func(t *testing.T) {
+		target := dir + "/dangling-target"
+		dst := dir + "/dangling"
+		if err := os.Symlink(target, dst); err != nil {
+			t.Fatalf("os.Symlink() failed: %v", err)
+		}
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		if _, err := os.Lstat(target); !os.IsNotExist(err) {
+			t.Errorf("os.Lstat(%q) err = %v, want not exist", target, err)
+		}
+	})
+
+	t.Run("existing FIFO does not block", func(t *testing.T) {
+		dst := dir + "/fifo"
+		if err := unix.Mkfifo(dst, 0600); err != nil {
+			t.Fatalf("unix.Mkfifo(%q) failed: %v", dst, err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- CreateMountPointFile(dst) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("CreateMountPointFile(%q) failed: %v", dst, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("CreateMountPointFile(%q) blocked on a FIFO", dst)
+		}
+	})
+}
+
+func TestSafeSetupAndMountRejectsSymlinkDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := dir + "/src"
+	if err := os.WriteFile(src, nil, 0644); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", src, err)
+	}
+	other := dir + "/other"
+	if err := os.WriteFile(other, nil, 0644); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", other, err)
+	}
+	missing := dir + "/missing"
+	for _, tc := range []struct {
+		name    string
+		target  string
+		wantErr string
+	}{
+		{name: "dangling", target: missing, wantErr: "failed to safely mount: Open("},
+		{name: "live", target: other, wantErr: "expected to open"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := dir + "/dst-" + tc.name
+			if err := os.Symlink(tc.target, dst); err != nil {
+				t.Fatalf("os.Symlink() failed: %v", err)
+			}
+			// The destination check must fail before mount(2) runs.
+			err := SafeSetupAndMount(src, dst, "bind", unix.MS_BIND, "")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("SafeSetupAndMount(%q -> %q) err = %v, want %q", dst, tc.target, err, tc.wantErr)
+			}
+			if _, err := os.Lstat(missing); !os.IsNotExist(err) {
+				t.Errorf("os.Lstat(%q) err = %v, want not exist", missing, err)
+			}
+		})
+	}
+}
