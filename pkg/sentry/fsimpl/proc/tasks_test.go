@@ -288,6 +288,54 @@ func TestSpecEnvironPermissions(t *testing.T) {
 	}
 }
 
+func TestSpecEnvironByName(t *testing.T) {
+	const (
+		containerName = "app"
+		path          = "/proc/gvisor/spec_environ"
+	)
+	s := setupWithData(t, &InternalData{
+		ContainerName: containerName,
+		ContainerUID:  343,
+		ContainerGID:  2401,
+	})
+	defer s.Destroy()
+
+	k := kernel.KernelFromContext(s.Ctx)
+	owner := auth.NewUserCredentials(343, 2401, nil, nil, s.Creds.UserNamespace)
+	readSpecEnviron := func() string {
+		t.Helper()
+		fd, err := s.VFS.OpenAt(s.Ctx, owner, s.PathOpAtRoot(path), &vfs.OpenOptions{Flags: linux.O_RDONLY})
+		if err != nil {
+			t.Fatalf("OpenAt(%q): %v", path, err)
+		}
+		defer fd.DecRef(s.Ctx)
+
+		buf := make([]byte, 1024)
+		n, err := fd.Read(s.Ctx, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
+		if err != nil && err != io.EOF {
+			t.Fatalf("Read(%q): %v", path, err)
+		}
+		return string(buf[:n])
+	}
+
+	k.RegisterContainerName("cid-1", containerName)
+	k.SetContainerEnv("cid-1", []string{"FOO=first", "BAR=1"})
+	if got, want := readSpecEnviron(), "FOO=first\x00BAR=1\x00"; got != want {
+		t.Errorf("readSpecEnviron() with single container = %q, want %q", got, want)
+	}
+
+	k.RegisterContainerName("cid-2", containerName)
+	k.SetContainerEnv("cid-2", []string{"FOO=second"})
+	if got := readSpecEnviron(); got != "" {
+		t.Errorf("readSpecEnviron() with duplicate container name = %q, want empty", got)
+	}
+
+	k.UnregisterContainer("cid-1")
+	if got, want := readSpecEnviron(), "FOO=second\x00"; got != want {
+		t.Errorf("readSpecEnviron() after unregistering cid-1 = %q, want %q", got, want)
+	}
+}
+
 func TestTasksWithOverrideProc(t *testing.T) {
 	s := setupWithData(t, &InternalData{
 		Cgroups: map[string]string{

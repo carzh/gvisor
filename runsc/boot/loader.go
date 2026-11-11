@@ -2791,6 +2791,7 @@ func (l *Loader) unregisterContainerLocked(cid string) {
 		delete(l.containerIDs, containerName)
 		delete(l.containerSpecs, containerName)
 	}
+	l.k.UnregisterContainer(cid)
 }
 
 // unnamedContainerNumber returns the number in a name given to a container

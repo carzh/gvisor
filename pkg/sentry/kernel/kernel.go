@@ -2780,6 +2780,15 @@ func (k *Kernel) RegisterContainerName(cid, containerName string) {
 	k.containerNames[cid] = containerName
 }
 
+// UnregisterContainer removes the container name and environment variables for
+// a given container ID.
+func (k *Kernel) UnregisterContainer(cid string) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	delete(k.containerNames, cid)
+	delete(k.containerEnvs, cid)
+}
+
 // RestoreContainerMapping remaps old container IDs to new ones after a restore.
 // containerIDs maps "name -> new container ID". Note that container names remain
 // constant between restore sessions.
@@ -2829,16 +2838,24 @@ func (k *Kernel) SpecEnviron(cid string) []string {
 }
 
 // SpecEnvironByName returns the environment variables for the container with
-// the given name.
+// the given name, or nil if no single container has that name.
 func (k *Kernel) SpecEnvironByName(containerName string) []string {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
+	var match string
+	found := false
 	for cid, name := range k.containerNames {
 		if name == containerName {
-			return slices.Clone(k.containerEnvs[cid])
+			if found {
+				return nil
+			}
+			match, found = cid, true
 		}
 	}
-	return nil
+	if !found {
+		return nil
+	}
+	return slices.Clone(k.containerEnvs[match])
 }
 
 func filterMFsToSave(mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, matchCtxs []*fsCheckpointMatchContext) map[checkpoint.ResourceID]*pgalloc.MemoryFile {
