@@ -31,7 +31,12 @@ import (
 type Options struct {
 	ProfileEnabled bool
 	CgoEnabled     bool
-	ExtraRules     []seccomp.SyscallRules
+	// PasstMode is true when netgofer runs in passt mode. In passt mode,
+	// netgofer only reads and writes two inherited sockets, so the syscalls
+	// that only proxy mode needs (host socket operations and recvmmsg/sendmmsg)
+	// are removed from the allowlist.
+	PasstMode  bool
+	ExtraRules []seccomp.SyscallRules
 }
 
 // isInstrumentationEnabled returns whether there are any
@@ -52,6 +57,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "ProfileEnabled=%t ", opt.ProfileEnabled)
 	fmt.Fprintf(&sb, "Instrumentation=%t ", isInstrumentationEnabled())
 	fmt.Fprintf(&sb, "CgoEnabled=%t ", opt.CgoEnabled)
+	fmt.Fprintf(&sb, "PasstMode=%t ", opt.PasstMode)
 	// Extra rules are not known at precompile time. Cannot precompile.
 	fmt.Fprintf(&sb, "ExtraRules=%t ", len(opt.ExtraRules) > 0)
 	return strings.TrimSpace(sb.String())
@@ -98,6 +104,11 @@ func Rules(opt Options) (seccomp.SyscallRules, seccomp.SyscallRules) {
 // using `vars` as override for variables defined during precompilation.
 func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, seccomp.SyscallRules) {
 	s := allowedSyscalls.Copy()
+	if opt.PasstMode {
+		for _, sysno := range proxyOnlySyscalls {
+			s.Remove(sysno)
+		}
+	}
 	s.Merge(filter.SelfPIDFilters(vars.GetUint64(filter.SelfPIDVarName)))
 	if opt.ProfileEnabled {
 		s.Merge(filter.ProfileFilters())
