@@ -64,6 +64,7 @@ go_test(
         "//runsc/config",
         "//runsc/flag",
         "//runsc/gofer/net/egressfilter",
+        "//runsc/gofer/net/filter",
         "@com_github_google_subcommands//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],

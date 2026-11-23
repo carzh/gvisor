@@ -18,6 +18,8 @@
 package filter
 
 import (
+	"fmt"
+
 	goferfilter "gvisor.dev/gvisor/runsc/gofer/filter"
 	"gvisor.dev/gvisor/runsc/gofer/net/filter/config"
 )
@@ -34,7 +36,13 @@ const (
 	PasstMode = config.PasstMode
 )
 
-// Install installs seccomp filters.
+// Install installs seccomp filters. It returns an error if opt.Mode is not a
+// valid mode.
 func Install(opt Options) error {
+	switch opt.Mode {
+	case ProxyMode, PasstMode:
+	default:
+		return fmt.Errorf("invalid netgofer mode: %v", opt.Mode)
+	}
 	return goferfilter.Install(opt, GetPrecompiled, ListPrecompiled)
 }

@@ -17,6 +17,7 @@ package config
 import (
 	"reflect"
 	"runtime"
+	"slices"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -77,33 +78,6 @@ func TestOptionsConfigKey(t *testing.T) {
 			key = newKey
 		}
 	})
-}
-
-// TestPasstModeRules verifies that passt mode removes the proxy-only
-// syscalls and adds nothing that proxy mode does not have.
-func TestPasstModeRules(t *testing.T) {
-	for _, profile := range []bool{false, true} {
-		for _, cgo := range []bool{false, true} {
-			proxyRules, _ := Options{ProfileEnabled: profile, CgoEnabled: cgo, Mode: ProxyMode}.Rules()
-			passtRules, _ := Options{ProfileEnabled: profile, CgoEnabled: cgo, Mode: PasstMode}.Rules()
-			for _, sysno := range proxyOnlySyscalls {
-				if !proxyRules.Has(sysno) {
-					t.Errorf("ProfileEnabled=%t CgoEnabled=%t: proxy mode rules do not allow syscall %d, but proxyOnlySyscalls lists it", profile, cgo, sysno)
-				}
-				if passtRules.Has(sysno) {
-					t.Errorf("ProfileEnabled=%t CgoEnabled=%t: passt mode rules allow proxy-only syscall %d", profile, cgo, sysno)
-				}
-			}
-			for _, sysno := range passtRules.Sysnos() {
-				if !proxyRules.Has(sysno) {
-					t.Errorf("ProfileEnabled=%t CgoEnabled=%t: passt mode rules allow syscall %d, which proxy mode does not", profile, cgo, sysno)
-				}
-			}
-			if got, want := passtRules.Size()+len(proxyOnlySyscalls), proxyRules.Size(); got != want {
-				t.Errorf("ProfileEnabled=%t CgoEnabled=%t: passt mode allows %d syscalls, want %d (proxy mode minus %d proxy-only syscalls)", profile, cgo, passtRules.Size(), want-len(proxyOnlySyscalls), len(proxyOnlySyscalls))
-			}
-		}
-	}
 }
 
 // TestPrecompiledPrograms verifies that all option variants precompile
@@ -168,7 +142,7 @@ func TestPrecompiledProgramsDeterministic(t *testing.T) {
 }
 
 func TestRules(t *testing.T) {
-	rules, _ := Rules(Options{})
+	rules, _ := Rules(Options{Mode: ProxyMode})
 
 	// Check some allowed syscalls
 	allowed := []uintptr{
@@ -209,6 +183,48 @@ func TestRules(t *testing.T) {
 		}
 		if rules.Has(sys) {
 			t.Errorf("Rules().Has(%d) = true, want false", sys)
+		}
+	}
+
+	// Only proxy mode opens and configures sockets, and uses the fdbased
+	// endpoint for I/O.
+	proxyOnly := []uintptr{
+		unix.SYS_SOCKET,
+		unix.SYS_CONNECT,
+		unix.SYS_GETSOCKOPT,
+		unix.SYS_SETSOCKOPT,
+		unix.SYS_GETPEERNAME,
+		unix.SYS_GETSOCKNAME,
+		unix.SYS_SHUTDOWN,
+		unix.SYS_PPOLL,
+		unix.SYS_READV,
+		unix.SYS_WRITEV,
+		unix.SYS_RECVMMSG,
+		unix.SYS_SENDMMSG,
+	}
+	for _, sys := range proxyOnly {
+		if !rules.Has(sys) {
+			t.Errorf("Rules().Has(%d) = false, want true", sys)
+		}
+	}
+	// The zero value of Mode is not a valid mode.
+	for _, mode := range []Mode{PasstMode, 0} {
+		modeRules, _ := Rules(Options{Mode: mode})
+		for _, sys := range []uintptr{
+			unix.SYS_READ,
+			unix.SYS_WRITE,
+		} {
+			if !modeRules.Has(sys) {
+				t.Errorf("Rules(Mode: %v).Has(%d) = false, want true", mode, sys)
+			}
+		}
+		for _, sys := range slices.Concat(proxyOnly, denied) {
+			if instrumentation.Has(sys) {
+				continue
+			}
+			if modeRules.Has(sys) {
+				t.Errorf("Rules(Mode: %v).Has(%d) = true, want false", mode, sys)
+			}
 		}
 	}
 }

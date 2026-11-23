@@ -44,7 +44,7 @@ func optionsToPrecompile() []Options {
 			return []Options{noProfile}
 		},
 
-		// proxy mode and passt mode.
+		// Each netgofer mode.
 		func(opt Options) []Options {
 			proxy := opt
 			proxy.Mode = ProxyMode

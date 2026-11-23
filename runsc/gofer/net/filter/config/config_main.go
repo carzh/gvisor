@@ -20,28 +20,11 @@ import (
 	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
-// proxyOnlySyscalls are the syscalls that only proxy mode uses: to open and
-// use host sockets, and (recvmmsg, sendmmsg) for the fdbased endpoint on the
-// sentry socket. passt mode does not need them: passt opens the host sockets,
-// and netgofer uses read and write on both inherited sockets.
-var proxyOnlySyscalls = []uintptr{
-	unix.SYS_CONNECT,
-	unix.SYS_GETPEERNAME,
-	unix.SYS_GETSOCKNAME,
-	unix.SYS_GETSOCKOPT,
-	unix.SYS_RECVMMSG,
-	unix.SYS_SENDMMSG,
-	unix.SYS_SETSOCKOPT,
-	unix.SYS_SHUTDOWN,
-	unix.SYS_SOCKET,
-}
-
-// allowedSyscalls is the set of syscalls executed by the netgofer.
+// allowedSyscalls is the set of syscalls that the filter allows in all modes.
+// A syscall that only one mode needs belongs in the filters of that mode.
 var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_CLOCK_GETTIME: seccomp.MatchAll{},
 	unix.SYS_CLOSE:         seccomp.MatchAll{},
-	// connect does not constrain the destination address since it is dynamic. Address filtering is handled in Go.
-	unix.SYS_CONNECT:       seccomp.MatchAll{},
 	unix.SYS_EPOLL_CREATE1: seccomp.MatchAll{},
 	unix.SYS_EPOLL_CTL:     seccomp.MatchAll{},
 	unix.SYS_EPOLL_PWAIT: seccomp.PerArg{
@@ -93,15 +76,8 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.EqualTo(0),
 		seccomp.EqualTo(0),
 	},
-	unix.SYS_GETPEERNAME: seccomp.MatchAll{},
-	unix.SYS_GETPID:      seccomp.MatchAll{},
-	unix.SYS_GETRANDOM:   seccomp.MatchAll{},
-	unix.SYS_GETSOCKNAME: seccomp.MatchAll{},
-	unix.SYS_GETSOCKOPT: seccomp.PerArg{
-		seccomp.AnyValue{}, // fd
-		seccomp.EqualTo(unix.SOL_SOCKET),
-		seccomp.EqualTo(unix.SO_ERROR),
-	},
+	unix.SYS_GETPID:       seccomp.MatchAll{},
+	unix.SYS_GETRANDOM:    seccomp.MatchAll{},
 	unix.SYS_GETTID:       seccomp.MatchAll{},
 	unix.SYS_GETTIMEOFDAY: seccomp.MatchAll{},
 	unix.SYS_MADVISE:      seccomp.MatchAll{},
@@ -128,7 +104,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_MPROTECT:  seccomp.MatchAll{},
 	unix.SYS_MUNMAP:    seccomp.MatchAll{},
 	unix.SYS_NANOSLEEP: seccomp.MatchAll{},
-	unix.SYS_PPOLL:     seccomp.MatchAll{},
 	unix.SYS_PRCTL: seccomp.PerArg{
 		seccomp.EqualTo(unix.PR_SET_VMA),
 		seccomp.EqualTo(unix.PR_SET_VMA_ANON_NAME),
@@ -137,15 +112,8 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 	},
 	// Used by Go's automatic GOMAXPROCS updater to read cgroup CPU limits.
-	unix.SYS_PREAD64: seccomp.MatchAll{},
-	unix.SYS_READ:    seccomp.MatchAll{},
-	unix.SYS_READV:   seccomp.MatchAll{},
-	unix.SYS_RECVMMSG: seccomp.PerArg{
-		seccomp.AnyValue{},
-		seccomp.AnyValue{},
-		seccomp.AnyValue{},
-		seccomp.EqualTo(unix.MSG_DONTWAIT),
-	},
+	unix.SYS_PREAD64:         seccomp.MatchAll{},
+	unix.SYS_READ:            seccomp.MatchAll{},
 	unix.SYS_RESTART_SYSCALL: seccomp.MatchAll{},
 	// May be used by the runtime during panic().
 	unix.SYS_RT_SIGACTION:   seccomp.MatchAll{},
@@ -156,93 +124,118 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.EqualTo(0),
 	},
 	unix.SYS_SCHED_YIELD: seccomp.MatchAll{},
-	unix.SYS_SENDMMSG: seccomp.PerArg{
-		seccomp.AnyValue{},
-		seccomp.AnyValue{},
-		seccomp.AnyValue{},
-		seccomp.EqualTo(unix.MSG_DONTWAIT),
-	},
-	unix.SYS_SETSOCKOPT: seccomp.Or{
-		seccomp.PerArg{
-			seccomp.AnyValue{}, // fd
-			seccomp.EqualTo(unix.SOL_SOCKET),
-			seccomp.EqualTo(unix.SO_BROADCAST),
-		},
-		seccomp.PerArg{
-			seccomp.AnyValue{}, // fd
-			seccomp.EqualTo(unix.SOL_SOCKET),
-			seccomp.EqualTo(unix.SO_KEEPALIVE),
-		},
-		seccomp.PerArg{
-			seccomp.AnyValue{}, // fd
-			seccomp.EqualTo(unix.IPPROTO_IPV6),
-			seccomp.EqualTo(unix.IPV6_V6ONLY),
-		},
-		seccomp.PerArg{
-			seccomp.AnyValue{}, // fd
-			seccomp.EqualTo(unix.IPPROTO_TCP),
-			seccomp.EqualTo(unix.TCP_KEEPINTVL),
-		},
-		seccomp.PerArg{
-			seccomp.AnyValue{}, // fd
-			seccomp.EqualTo(unix.IPPROTO_TCP),
-			seccomp.EqualTo(unix.TCP_KEEPIDLE),
-		},
-		seccomp.PerArg{
-			seccomp.AnyValue{}, // fd
-			seccomp.EqualTo(unix.IPPROTO_TCP),
-			seccomp.EqualTo(unix.TCP_KEEPCNT),
-		},
-		seccomp.PerArg{
-			seccomp.AnyValue{}, // fd
-			seccomp.EqualTo(unix.IPPROTO_TCP),
-			seccomp.EqualTo(unix.TCP_NODELAY),
-		},
-	},
-	unix.SYS_SHUTDOWN:    seccomp.MatchAll{},
 	unix.SYS_SIGALTSTACK: seccomp.MatchAll{},
-	unix.SYS_SOCKET: seccomp.Or{
-		seccomp.PerArg{
-			seccomp.EqualTo(unix.AF_INET),
-			seccomp.EqualTo(unix.SOCK_STREAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
-			seccomp.EqualTo(0),
-		},
-		seccomp.PerArg{
-			seccomp.EqualTo(unix.AF_INET),
-			seccomp.EqualTo(unix.SOCK_STREAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
-			seccomp.EqualTo(unix.IPPROTO_TCP),
-		},
-		seccomp.PerArg{
-			seccomp.EqualTo(unix.AF_INET),
-			seccomp.EqualTo(unix.SOCK_DGRAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
-			seccomp.EqualTo(0),
-		},
-		seccomp.PerArg{
-			seccomp.EqualTo(unix.AF_INET),
-			seccomp.EqualTo(unix.SOCK_DGRAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
-			seccomp.EqualTo(unix.IPPROTO_UDP),
-		},
-		seccomp.PerArg{
-			seccomp.EqualTo(unix.AF_INET6),
-			seccomp.EqualTo(unix.SOCK_STREAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
-			seccomp.EqualTo(0),
-		},
-		seccomp.PerArg{
-			seccomp.EqualTo(unix.AF_INET6),
-			seccomp.EqualTo(unix.SOCK_STREAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
-			seccomp.EqualTo(unix.IPPROTO_TCP),
-		},
-		seccomp.PerArg{
-			seccomp.EqualTo(unix.AF_INET6),
-			seccomp.EqualTo(unix.SOCK_DGRAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
-			seccomp.EqualTo(0),
-		},
-		seccomp.PerArg{
-			seccomp.EqualTo(unix.AF_INET6),
-			seccomp.EqualTo(unix.SOCK_DGRAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
-			seccomp.EqualTo(unix.IPPROTO_UDP),
-		},
-	},
-	unix.SYS_WRITE:  seccomp.MatchAll{},
-	unix.SYS_WRITEV: seccomp.MatchAll{},
+	unix.SYS_WRITE:       seccomp.MatchAll{},
 })
+
+// proxyModeFilters returns the syscalls that the filter allows only in proxy
+// mode: the syscalls that open and use host sockets, and the syscalls that
+// the fdbased endpoint uses for I/O on the sandbox socket.
+func proxyModeFilters() seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		// connect does not constrain the destination address since it is dynamic. Address filtering is handled in Go.
+		unix.SYS_CONNECT:     seccomp.MatchAll{},
+		unix.SYS_GETPEERNAME: seccomp.MatchAll{},
+		unix.SYS_GETSOCKNAME: seccomp.MatchAll{},
+		unix.SYS_GETSOCKOPT: seccomp.PerArg{
+			seccomp.AnyValue{}, // fd
+			seccomp.EqualTo(unix.SOL_SOCKET),
+			seccomp.EqualTo(unix.SO_ERROR),
+		},
+		unix.SYS_PPOLL: seccomp.MatchAll{},
+		unix.SYS_READV: seccomp.MatchAll{},
+		unix.SYS_RECVMMSG: seccomp.PerArg{
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.MSG_DONTWAIT),
+		},
+		unix.SYS_SENDMMSG: seccomp.PerArg{
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.MSG_DONTWAIT),
+		},
+		unix.SYS_SETSOCKOPT: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.AnyValue{}, // fd
+				seccomp.EqualTo(unix.SOL_SOCKET),
+				seccomp.EqualTo(unix.SO_BROADCAST),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{}, // fd
+				seccomp.EqualTo(unix.SOL_SOCKET),
+				seccomp.EqualTo(unix.SO_KEEPALIVE),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{}, // fd
+				seccomp.EqualTo(unix.IPPROTO_IPV6),
+				seccomp.EqualTo(unix.IPV6_V6ONLY),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{}, // fd
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+				seccomp.EqualTo(unix.TCP_KEEPINTVL),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{}, // fd
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+				seccomp.EqualTo(unix.TCP_KEEPIDLE),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{}, // fd
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+				seccomp.EqualTo(unix.TCP_KEEPCNT),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{}, // fd
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+				seccomp.EqualTo(unix.TCP_NODELAY),
+			},
+		},
+		unix.SYS_SHUTDOWN: seccomp.MatchAll{},
+		unix.SYS_SOCKET: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.EqualTo(unix.AF_INET),
+				seccomp.EqualTo(unix.SOCK_STREAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+				seccomp.EqualTo(0),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(unix.AF_INET),
+				seccomp.EqualTo(unix.SOCK_STREAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(unix.AF_INET),
+				seccomp.EqualTo(unix.SOCK_DGRAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+				seccomp.EqualTo(0),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(unix.AF_INET),
+				seccomp.EqualTo(unix.SOCK_DGRAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+				seccomp.EqualTo(unix.IPPROTO_UDP),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(unix.AF_INET6),
+				seccomp.EqualTo(unix.SOCK_STREAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+				seccomp.EqualTo(0),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(unix.AF_INET6),
+				seccomp.EqualTo(unix.SOCK_STREAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+				seccomp.EqualTo(unix.IPPROTO_TCP),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(unix.AF_INET6),
+				seccomp.EqualTo(unix.SOCK_DGRAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+				seccomp.EqualTo(0),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(unix.AF_INET6),
+				seccomp.EqualTo(unix.SOCK_DGRAM | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+				seccomp.EqualTo(unix.IPPROTO_UDP),
+			},
+		},
+		unix.SYS_WRITEV: seccomp.MatchAll{},
+	})
+}
