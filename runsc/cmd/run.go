@@ -90,6 +90,18 @@ func (r *Run) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Sp
 	return id, spec, nil
 }
 
+// validateRootlessSandboxNet checks that conf can support sandbox networking
+// when --rootless is set (or euid != 0).
+func validateRootlessSandboxNet(conf *config.Config, euid int) error {
+	if conf.Network != config.NetworkSandbox || conf.UsePasst(euid) {
+		return nil
+	}
+	if conf.UseNetworkProxy() || conf.XDP.Mode != config.XDPModeOff {
+		return fmt.Errorf("sandbox network with --rootless requires passt (https://passt.top) and is incompatible with --netgofer, --network-proxy-path, and XDP")
+	}
+	return fmt.Errorf("sandbox network with --rootless requires passt (https://passt.top): install it at %s, or set --passt-binary, or use --network=none or --network=host", config.DefaultPasstBinary)
+}
+
 // Execute implements subcommands.Command.Execute.
 func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
@@ -101,8 +113,8 @@ func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
 	waitStatus := args[1].(*unix.WaitStatus)
 
 	if conf.Rootless {
-		if conf.Network == config.NetworkSandbox {
-			return util.Errorf("sandbox network isn't supported with --rootless, use --network=none or --network=host")
+		if err := validateRootlessSandboxNet(conf, 0); err != nil {
+			return util.Errorf("%v", err)
 		}
 
 		if err := specutils.MaybeRunAsRoot(); err != nil {

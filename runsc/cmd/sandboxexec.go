@@ -115,6 +115,11 @@ func (c *SandboxExec) Execute(_ context.Context, f *flag.FlagSet, args ...any) s
 	if err != nil {
 		return util.Errorf("creating spec: %v", err)
 	}
+	if conf.Rootless {
+		if err := validateRootlessSandboxNet(conf, 0); err != nil {
+			return util.Errorf("%v", err)
+		}
+	}
 
 	// Start Container
 	tmpDir, err := os.MkdirTemp("", "runsc-sandboxexec")
