@@ -58,14 +58,38 @@ func (f *Agency) DonateAndClose(flag string, files ...*os.File) {
 	f.closePending = append(f.closePending, files...)
 }
 
-// DonateLogFile is similar to DonateAndClose but handles the opening of
-// the file using specutils.OpenLogFile() for convenience. It's a noop, if
-// path is empty.
+// DonateLogFile is similar to DonateAndClose but handles the opening of the
+// file using log.OpenFile() for convenience. It supports read-only opens,
+// write-only opens with os.O_APPEND, and os.O_CREATE|os.O_WRONLY|os.O_TRUNC
+// (other flag combinations return an error even if logPattern is empty). When
+// flags is os.O_CREATE|os.O_WRONLY|os.O_TRUNC, the file is opened with
+// specutils.OpenTruncatedLogFile() (rejecting trailing symbolic links,
+// non-regular files, and files with more than one hard link). For supported
+// flags, it is a no-op if logPattern is empty.
 func (f *Agency) DonateLogFile(flag, logPattern string, flags int, opts log.FileOpts) error {
+	isTrunc := flags == os.O_CREATE|os.O_WRONLY|os.O_TRUNC
+	if !isTrunc {
+		if flags&os.O_TRUNC != 0 {
+			return fmt.Errorf("DonateLogFile only supports os.O_TRUNC with os.O_CREATE|os.O_WRONLY; got flags %#x", flags)
+		}
+		if flags&os.O_RDWR != 0 ||
+			(flags&os.O_WRONLY != 0 && flags&os.O_APPEND == 0) ||
+			(flags&os.O_WRONLY == 0 && flags&(os.O_CREATE|os.O_APPEND) != 0) {
+			return fmt.Errorf("DonateLogFile only supports read-only, append-only, or O_CREATE|O_WRONLY|O_TRUNC opens; got flags %#x", flags)
+		}
+	}
 	if len(logPattern) == 0 {
 		return nil
 	}
-	file, err := log.OpenFile(logPattern, flags, opts)
+	var (
+		file *os.File
+		err  error
+	)
+	if isTrunc {
+		file, err = specutils.OpenTruncatedLogFile(logPattern, opts)
+	} else {
+		file, err = log.OpenFile(logPattern, flags, opts)
+	}
 	if err != nil {
 		return err
 	}

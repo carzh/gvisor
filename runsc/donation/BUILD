@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -14,5 +14,16 @@ go_library(
     deps = [
         "//pkg/log",
         "//runsc/specutils",
+    ],
+)
+
+go_test(
+    name = "donation_test",
+    size = "small",
+    srcs = ["donation_test.go"],
+    embed = [":donation"],
+    deps = [
+        "//pkg/log",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

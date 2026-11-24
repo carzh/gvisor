@@ -807,6 +807,41 @@ func OpenDebugLogFile(logPattern string, opts log.FileOpts) (*os.File, error) {
 	return log.OpenFile(logPattern, os.O_WRONLY|os.O_CREATE|os.O_APPEND, opts)
 }
 
+// OpenTruncatedLogFile opens and truncates a log file using logPattern and
+// opts to construct the path, creating missing parent directories with mode
+// 0755 and creating the file with mode 0644 if it does not exist. It uses
+// OpenAndTruncateRegularFile, so it returns an error if the last component of
+// the expanded path is a symbolic link, is not a regular file, or has more
+// than one hard link. Directory-denoting expanded paths (ending in "/", "/.",
+// or "/..", or equal to "." or ".."), empty expanded paths, and paths
+// containing NUL bytes return an error before creating parent directories.
+// Returned errors wrap the underlying error with %w. It returns (nil, nil) if
+// logPattern is empty.
+func OpenTruncatedLogFile(logPattern string, opts log.FileOpts) (*os.File, error) {
+	if len(logPattern) == 0 {
+		return nil, nil
+	}
+	logPath := opts.Build(logPattern)
+	if len(logPath) == 0 {
+		return nil, fmt.Errorf("error opening file: %w", &os.PathError{Op: "open", Path: logPath, Err: unix.ENOENT})
+	}
+	if strings.IndexByte(logPath, 0) >= 0 {
+		return nil, fmt.Errorf("error opening file: %w", &os.PathError{Op: "open", Path: logPath, Err: unix.EINVAL})
+	}
+	if _, base := filepath.Split(logPath); base == "" || base == "." || base == ".." {
+		return nil, fmt.Errorf("error opening file: %w", &os.PathError{Op: "open", Path: logPath, Err: unix.EISDIR})
+	}
+	dir := filepath.Dir(logPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("error creating dir %q: %w", dir, err)
+	}
+	f, err := OpenAndTruncateRegularFile(logPath, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("error opening file: %w", err)
+	}
+	return f, nil
+}
+
 // LogFileOpts implements log.FileOpts for runsc log files.
 // It builds the log file path based using the following variables:
 //   - %TIMESTAMP%: is replaced with Timestamp using the following format:

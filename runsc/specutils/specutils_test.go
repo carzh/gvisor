@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -1463,4 +1464,108 @@ func TestApplyNSRestoresThreadNamespace(t *testing.T) {
 	if restoredNS != threadNS {
 		t.Errorf("after restore, thread netns = %q, want %q (leader netns is %q)", restoredNS, threadNS, leaderNS)
 	}
+}
+
+func TestOpenTruncatedLogFileEmpty(t *testing.T) {
+	f, err := OpenTruncatedLogFile("", &LogFileOpts{})
+	if err != nil || f != nil {
+		if f != nil {
+			_ = f.Close()
+		}
+		t.Fatalf("OpenTruncatedLogFile(\"\") = (%v, %v), want (nil, nil)", f, err)
+	}
+}
+
+func TestOpenTruncatedLogFileCreatesAndTruncates(t *testing.T) {
+	// Clear the umask so that created directory and file modes are exact.
+	oldMask := unix.Umask(0)
+	t.Cleanup(func() { _ = unix.Umask(oldMask) })
+
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "%ID%", "b", "out.%ID%.log")
+	opts := &LogFileOpts{SandboxID: "sb1"}
+	wantDir := filepath.Join(dir, "sb1", "b")
+	wantPath := filepath.Join(wantDir, "out.sb1.log")
+
+	f, err := OpenTruncatedLogFile(pattern, opts)
+	if err != nil {
+		t.Fatalf("OpenTruncatedLogFile(%q) failed: %v", pattern, err)
+	}
+	dirInfo, err := os.Lstat(wantDir)
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("os.Lstat(%q) failed: %v", wantDir, err)
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode().Perm() != 0755 {
+		t.Errorf("created dir %q has mode %v, want directory with mode 0755", wantDir, dirInfo.Mode())
+	}
+	fi, err := os.Lstat(wantPath)
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("os.Lstat(%q) failed: %v", wantPath, err)
+	}
+	if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0644 || fi.Size() != 0 {
+		t.Errorf("created file %q has mode %v and size %d, want regular file with mode 0644 and size 0", wantPath, fi.Mode(), fi.Size())
+	}
+	if _, err := f.Write([]byte("old-bytes")); err != nil {
+		_ = f.Close()
+		t.Fatalf("f.Write() failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("f.Close() failed: %v", err)
+	}
+
+	// Second call opens and truncates the existing regular file.
+	f2, err := OpenTruncatedLogFile(pattern, opts)
+	if err != nil {
+		t.Fatalf("second OpenTruncatedLogFile(%q) failed: %v", pattern, err)
+	}
+	defer f2.Close()
+	if _, err := f2.Write([]byte("new")); err != nil {
+		t.Fatalf("f2.Write() failed: %v", err)
+	}
+	got, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) failed: %v", wantPath, err)
+	}
+	if string(got) != "new" {
+		t.Errorf("file content = %q, want %q", got, "new")
+	}
+}
+
+func TestOpenTruncatedLogFileRejects(t *testing.T) {
+	t.Run("trailing slash", func(t *testing.T) {
+		dir := t.TempDir()
+		f, err := OpenTruncatedLogFile(filepath.Join(dir, "%ID%"), &LogFileOpts{SandboxID: "newdir/"})
+		if err == nil {
+			_ = f.Close()
+			t.Fatal("OpenTruncatedLogFile() succeeded, want EISDIR")
+		}
+		if !errors.Is(err, unix.EISDIR) {
+			t.Errorf("OpenTruncatedLogFile() = %v, want EISDIR", err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "newdir")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("os.Lstat(newdir) = %v, want os.ErrNotExist", err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		other := filepath.Join(dir, "other")
+		if err := os.WriteFile(other, nil, 0600); err != nil {
+			t.Fatalf("os.WriteFile(%q) failed: %v", other, err)
+		}
+		path := filepath.Join(dir, "out.log")
+		if err := os.Symlink(other, path); err != nil {
+			t.Fatalf("os.Symlink(%q, %q) failed: %v", other, path, err)
+		}
+		f, err := OpenTruncatedLogFile(path, &LogFileOpts{})
+		if err == nil {
+			_ = f.Close()
+			t.Fatalf("OpenTruncatedLogFile(%q) succeeded, want ELOOP", path)
+		}
+		if !errors.Is(err, unix.ELOOP) {
+			t.Errorf("OpenTruncatedLogFile(%q) = %v, want ELOOP", path, err)
+		}
+	})
 }
