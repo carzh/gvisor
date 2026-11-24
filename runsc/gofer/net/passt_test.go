@@ -544,10 +544,6 @@ const (
 	// seccompChildProxySocket installs the proxy mode seccomp filters, then
 	// calls socket(2).
 	seccompChildProxySocket = "proxy-socket"
-
-	// seccompChildInvalidMode installs the seccomp filters with the zero
-	// Mode.
-	seccompChildInvalidMode = "invalid-mode"
 )
 
 // TestMain runs the tests of this package, or a child process of the seccomp
@@ -605,15 +601,6 @@ func runSeccompChild(role string) {
 			os.Exit(3)
 		}
 		_, _, _ = unix.RawSyscall(unix.SYS_CLOSE, fd, 0, 0)
-		os.Exit(0)
-	case seccompChildInvalidMode:
-		// If Install succeeds, the filter allows write(2) and exit_group(2).
-		err := netgoferfilter.Install(netgoferfilter.Options{CgoEnabled: config.CgoEnabled})
-		if err == nil {
-			fmt.Fprintf(os.Stderr, "Install() with the zero Mode succeeded\n")
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "Install() failed: %v\n", err)
 		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown %s value: %q\n", seccompChildEnv, role)
@@ -703,14 +690,4 @@ func TestRunPasstModeWithSeccomp(t *testing.T) {
 			t.Fatalf("socket child status = %v (signal %v), want SIGSYS; output:\n%s", ws, ws.Signal(), out)
 		}
 	})
-}
-
-func TestSeccompInstallInvalidMode(t *testing.T) {
-	out, err := seccompChildCommand(seccompChildInvalidMode).CombinedOutput()
-	if err != nil {
-		t.Fatalf("Install() with the zero Mode did not fail in the child: %v; output:\n%s", err, out)
-	}
-	if want := "invalid netgofer mode"; !strings.Contains(string(out), want) {
-		t.Errorf("child output = %q, want an error that contains %q", out, want)
-	}
 }

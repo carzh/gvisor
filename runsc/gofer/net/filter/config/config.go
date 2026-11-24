@@ -29,8 +29,7 @@ import (
 
 // Mode is the netgofer mode that the seccomp filter allows.
 //
-// The zero value is not a valid mode. Its rules have only the syscalls that
-// the filter allows in all modes.
+// The zero value is not a valid mode.
 type Mode int
 
 const (
@@ -128,8 +127,12 @@ func Rules(opt Options) (seccomp.SyscallRules, seccomp.SyscallRules) {
 // using `vars` as override for variables defined during precompilation.
 func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, seccomp.SyscallRules) {
 	s := allowedSyscalls.Copy()
-	if opt.Mode == ProxyMode {
+	switch opt.Mode {
+	case ProxyMode:
 		s.Merge(proxyModeFilters())
+	case PasstMode:
+	default:
+		panic(fmt.Sprintf("invalid netgofer mode: %v", opt.Mode))
 	}
 	s.Merge(filter.SelfPIDFilters(vars.GetUint64(filter.SelfPIDVarName)))
 	if opt.ProfileEnabled {
