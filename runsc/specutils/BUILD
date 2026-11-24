@@ -15,6 +15,7 @@ go_library(
         "namespace.go",
         "nvidia.go",
         "rdma.go",
+        "regular_file.go",
         "restore.go",
         "seccomp.go",
         "specutils.go",
@@ -24,6 +25,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/abi/nvgpu",
+        "//pkg/cleanup",
         "//pkg/log",
         "//pkg/rdma",
         "//pkg/sentry/devices/nvproxy/nvconf",
@@ -44,6 +46,7 @@ go_test(
     size = "small",
     srcs = [
         "gofer_conf_test.go",
+        "regular_file_test.go",
         "specutils_test.go",
     ],
     embed = [":specutils"],
