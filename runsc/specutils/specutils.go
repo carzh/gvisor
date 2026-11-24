@@ -19,6 +19,7 @@ package specutils
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -936,17 +937,33 @@ func SafeSetupAndMount(src, dst, typ string, flags uint32, procPath string) erro
 		if err := os.MkdirAll(parent, 0777); err != nil {
 			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
-		// Create the destination file if it does not exist.
-		f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
-		if err != nil {
-			return fmt.Errorf("open(%q) failed: %v", dst, err)
+		if err := CreateMountPointFile(dst); err != nil {
+			return err
 		}
-		f.Close()
 	}
 
 	// Do the mount.
 	if err := SafeMount(src, dst, typ, uintptr(flags), "", procPath); err != nil {
 		return fmt.Errorf("mount(%q, %q, %d) failed: %v", src, dst, flags, err)
+	}
+	return nil
+}
+
+// CreateMountPointFile creates an empty regular file at dst for a file mount
+// point. It does nothing if dst already exists, including as a symlink or
+// another file type: the caller must verify dst before it mounts on it.
+// O_EXCL implies O_NOFOLLOW for the final path component, so
+// CreateMountPointFile never creates the target of a symlink at dst.
+func CreateMountPointFile(dst string) error {
+	f, err := os.OpenFile(dst, os.O_RDONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW|unix.O_NOCTTY|unix.O_CLOEXEC, 0666)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+		return fmt.Errorf("creating mount point %q: %w", dst, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing mount point %q: %w", dst, err)
 	}
 	return nil
 }

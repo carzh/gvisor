@@ -15,6 +15,9 @@
 package sandboxsetup
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -84,6 +87,43 @@ func TestShouldExposeTpuDevice(t *testing.T) {
 			got := ShouldExposeTpuDevice(tst.path)
 			if got != tst.want {
 				t.Errorf("ShouldExposeTpuDevice(%q) = %v, want %v", tst.path, got, tst.want)
+			}
+		})
+	}
+}
+
+func TestSafeSetupAndMoveMountRejectsSymlinkDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, nil, 0644); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", src, err)
+	}
+	other := filepath.Join(dir, "other")
+	if err := os.WriteFile(other, nil, 0644); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", other, err)
+	}
+	missing := filepath.Join(dir, "missing")
+	for _, tc := range []struct {
+		name    string
+		target  string
+		wantErr string
+	}{
+		{name: "dangling", target: missing, wantErr: "failed to safely move mount: Open"},
+		{name: "live", target: other, wantErr: "expected to open"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := filepath.Join(dir, "dst-"+tc.name)
+			if err := os.Symlink(tc.target, dst); err != nil {
+				t.Fatalf("os.Symlink() failed: %v", err)
+			}
+			// The source mount FD is invalid: the destination check must fail
+			// before move_mount(2) runs.
+			err := safeSetupAndMoveMount(-1, src, dst, "")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("safeSetupAndMoveMount(%q -> %q) err = %v, want %q", dst, tc.target, err, tc.wantErr)
+			}
+			if _, err := os.Lstat(missing); !os.IsNotExist(err) {
+				t.Errorf("os.Lstat(%q) err = %v, want not exist", missing, err)
 			}
 		})
 	}
