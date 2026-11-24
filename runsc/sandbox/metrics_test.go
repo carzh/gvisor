@@ -38,6 +38,8 @@ type containerManager struct {
 
 	// +checkatomic
 	requests atomic.Int64
+
+	setNetwork func(*sentryapi.CreateLinksAndRoutesArgs) error
 }
 
 func (cm *containerManager) GetSavings(_ *struct{}, savings *sentryapi.Savings) error {
