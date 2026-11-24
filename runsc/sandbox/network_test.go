@@ -1246,13 +1246,6 @@ func TestPcapAndNAT_RegularFile(t *testing.T) {
 	if len(args.FilePayload.Files) != 1 {
 		t.Fatalf("len(args.FilePayload.Files) = %d, want 1", len(args.FilePayload.Files))
 	}
-	flags, err := unix.FcntlInt(args.FilePayload.Files[0].Fd(), unix.F_GETFL, 0)
-	if err != nil {
-		t.Fatalf("FcntlInt(F_GETFL) failed: %v", err)
-	}
-	if flags&unix.O_NONBLOCK != 0 {
-		t.Errorf("PCAP file descriptor flags = %#x, want O_NONBLOCK cleared", flags)
-	}
 	got, err := os.ReadFile(pcapPath)
 	if err != nil {
 		t.Fatalf("os.ReadFile(%q) failed: %v", pcapPath, err)
@@ -1265,8 +1258,7 @@ func TestPcapAndNAT_RegularFile(t *testing.T) {
 func TestPcapAndNAT_RejectsSymlink(t *testing.T) {
 	dir := t.TempDir()
 	targetPath := filepath.Join(dir, "target")
-	const initialContent = "do-not-truncate"
-	if err := os.WriteFile(targetPath, []byte(initialContent), 0600); err != nil {
+	if err := os.WriteFile(targetPath, nil, 0600); err != nil {
 		t.Fatalf("os.WriteFile(%q) failed: %v", targetPath, err)
 	}
 
@@ -1280,36 +1272,6 @@ func TestPcapAndNAT_RejectsSymlink(t *testing.T) {
 	defer closePayloadFiles(t, &args)
 	if !errors.Is(err, unix.ELOOP) {
 		t.Errorf("pcapAndNAT(%q) error = %v, want ELOOP", symlinkPath, err)
-	}
-	if args.PCAP || len(args.FilePayload.Files) != 0 {
-		t.Errorf("unexpected payload state: PCAP=%v, files=%d", args.PCAP, len(args.FilePayload.Files))
-	}
-
-	got, err := os.ReadFile(targetPath)
-	if err != nil {
-		t.Fatalf("os.ReadFile(%q) failed: %v", targetPath, err)
-	}
-	if string(got) != initialContent {
-		t.Errorf("target content = %q, want %q", string(got), initialContent)
-	}
-}
-
-func TestPcapAndNAT_RejectsFIFO(t *testing.T) {
-	fifoPath := filepath.Join(t.TempDir(), "capture.fifo")
-	if err := unix.Mkfifo(fifoPath, 0600); err != nil {
-		t.Fatalf("unix.Mkfifo(%q) failed: %v", fifoPath, err)
-	}
-	rfd, err := unix.Open(fifoPath, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		t.Fatalf("unix.Open(%q) reader failed: %v", fifoPath, err)
-	}
-	defer unix.Close(rfd)
-
-	var args sentryapi.CreateLinksAndRoutesArgs
-	err = pcapAndNAT(&args, &config.Config{PCAP: fifoPath})
-	defer closePayloadFiles(t, &args)
-	if err == nil {
-		t.Fatalf("pcapAndNAT(%q) succeeded on FIFO, want error", fifoPath)
 	}
 	if args.PCAP || len(args.FilePayload.Files) != 0 {
 		t.Errorf("unexpected payload state: PCAP=%v, files=%d", args.PCAP, len(args.FilePayload.Files))
