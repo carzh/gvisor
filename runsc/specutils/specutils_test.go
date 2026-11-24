@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -1529,11 +1530,23 @@ func TestApplyNSRestoresThreadNamespace(t *testing.T) {
 	}
 }
 
-func TestCreateMountPointFile(t *testing.T) {
-	dir := t.TempDir()
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks(t.TempDir()) failed: %v", err)
+	}
+	return dir
+}
 
-	t.Run("missing file is created without execute bits", func(t *testing.T) {
-		dst := dir + "/new"
+func TestCreateMountPointFile(t *testing.T) {
+	dir := realTempDir(t)
+
+	t.Run("missing file is created with mode 0644", func(t *testing.T) {
+		oldUmask := unix.Umask(0)
+		defer unix.Umask(oldUmask)
+
+		dst := filepath.Join(dir, "new")
 		if err := CreateMountPointFile(dst); err != nil {
 			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
 		}
@@ -1541,13 +1554,13 @@ func TestCreateMountPointFile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("os.Lstat(%q) failed: %v", dst, err)
 		}
-		if !fi.Mode().IsRegular() || fi.Mode().Perm()&0111 != 0 {
-			t.Errorf("mode = %v, want a regular file without execute bits", fi.Mode())
+		if !fi.Mode().IsRegular() || fi.Size() != 0 || fi.Mode().Perm() != 0644 {
+			t.Errorf("lstat = (mode=%v, size=%d), want regular empty file with mode 0644", fi.Mode(), fi.Size())
 		}
 	})
 
 	t.Run("existing file is unchanged", func(t *testing.T) {
-		dst := dir + "/existing"
+		dst := filepath.Join(dir, "existing")
 		if err := os.WriteFile(dst, []byte("data"), 0444); err != nil {
 			t.Fatalf("os.WriteFile(%q) failed: %v", dst, err)
 		}
@@ -1559,22 +1572,123 @@ func TestCreateMountPointFile(t *testing.T) {
 		}
 	})
 
+	t.Run("existing unreadable file is unchanged", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses 0000 file mode")
+		}
+		dst := filepath.Join(dir, "unreadable")
+		if err := os.WriteFile(dst, nil, 0000); err != nil {
+			t.Fatalf("os.WriteFile(%q) failed: %v", dst, err)
+		}
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		fi, err := os.Lstat(dst)
+		if err != nil {
+			t.Fatalf("os.Lstat(%q) failed: %v", dst, err)
+		}
+		if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0 {
+			t.Errorf("mode = %v, want regular file with mode 0000", fi.Mode())
+		}
+	})
+
+	t.Run("existing directory is unchanged", func(t *testing.T) {
+		dst := filepath.Join(dir, "existing-dir")
+		if err := os.Mkdir(dst, 0755); err != nil {
+			t.Fatalf("os.Mkdir(%q) failed: %v", dst, err)
+		}
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		fi, err := os.Lstat(dst)
+		if err != nil || !fi.IsDir() {
+			t.Errorf("os.Lstat(%q) = (%v, %v), want directory", dst, fi, err)
+		}
+	})
+
+	t.Run("existing file in read-only directory succeeds", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses 0555 directory mode")
+		}
+		roDir := filepath.Join(dir, "ro-dir-existing")
+		if err := os.Mkdir(roDir, 0755); err != nil {
+			t.Fatalf("os.Mkdir(%q) failed: %v", roDir, err)
+		}
+		existing := filepath.Join(roDir, "existing")
+		if err := os.WriteFile(existing, nil, 0644); err != nil {
+			t.Fatalf("os.WriteFile(%q) failed: %v", existing, err)
+		}
+		if err := os.Chmod(roDir, 0555); err != nil {
+			t.Fatalf("os.Chmod(%q, 0555) failed: %v", roDir, err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(roDir, 0755) })
+
+		if err := CreateMountPointFile(existing); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", existing, err)
+		}
+	})
+
+	t.Run("missing file in read-only directory returns permission error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses 0555 directory mode")
+		}
+		roDir := filepath.Join(dir, "ro-dir-missing")
+		if err := os.Mkdir(roDir, 0755); err != nil {
+			t.Fatalf("os.Mkdir(%q) failed: %v", roDir, err)
+		}
+		if err := os.Chmod(roDir, 0555); err != nil {
+			t.Fatalf("os.Chmod(%q, 0555) failed: %v", roDir, err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(roDir, 0755) })
+
+		missing := filepath.Join(roDir, "missing")
+		if err := CreateMountPointFile(missing); !errors.Is(err, os.ErrPermission) {
+			t.Errorf("CreateMountPointFile(%q) err = %v, want %v", missing, err, os.ErrPermission)
+		}
+	})
+
+	t.Run("missing parent returns error", func(t *testing.T) {
+		dst := filepath.Join(dir, "missing-parent", "dst")
+		if err := CreateMountPointFile(dst); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("CreateMountPointFile(%q) err = %v, want %v", dst, err, os.ErrNotExist)
+		}
+	})
+
 	t.Run("dangling symlink target is not created", func(t *testing.T) {
-		target := dir + "/dangling-target"
-		dst := dir + "/dangling"
+		target := filepath.Join(dir, "dangling-target")
+		dst := filepath.Join(dir, "dangling")
 		if err := os.Symlink(target, dst); err != nil {
 			t.Fatalf("os.Symlink() failed: %v", err)
 		}
 		if err := CreateMountPointFile(dst); err != nil {
 			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
 		}
-		if _, err := os.Lstat(target); !os.IsNotExist(err) {
-			t.Errorf("os.Lstat(%q) err = %v, want not exist", target, err)
+		if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("os.Lstat(%q) err = %v, want %v", target, err, os.ErrNotExist)
+		}
+	})
+
+	t.Run("intermediate symlink is rejected", func(t *testing.T) {
+		realDir := filepath.Join(dir, "real-dir")
+		if err := os.Mkdir(realDir, 0755); err != nil {
+			t.Fatalf("os.Mkdir(%q) failed: %v", realDir, err)
+		}
+		linkDir := filepath.Join(dir, "link-dir")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Fatalf("os.Symlink() failed: %v", err)
+		}
+		dst := filepath.Join(linkDir, "dst")
+		if err := CreateMountPointFile(dst); !errors.Is(err, unix.ELOOP) {
+			t.Fatalf("CreateMountPointFile(%q) err = %v, want %v", dst, err, unix.ELOOP)
+		}
+		target := filepath.Join(realDir, "dst")
+		if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("os.Lstat(%q) err = %v, want %v", target, err, os.ErrNotExist)
 		}
 	})
 
 	t.Run("existing FIFO does not block", func(t *testing.T) {
-		dst := dir + "/fifo"
+		dst := filepath.Join(dir, "fifo")
 		if err := unix.Mkfifo(dst, 0600); err != nil {
 			t.Fatalf("unix.Mkfifo(%q) failed: %v", dst, err)
 		}
@@ -1591,38 +1705,23 @@ func TestCreateMountPointFile(t *testing.T) {
 	})
 }
 
-func TestSafeSetupAndMountRejectsSymlinkDestination(t *testing.T) {
-	dir := t.TempDir()
-	src := dir + "/src"
+func TestSafeSetupAndMountDanglingSymlink(t *testing.T) {
+	dir := realTempDir(t)
+	src := filepath.Join(dir, "src")
 	if err := os.WriteFile(src, nil, 0644); err != nil {
 		t.Fatalf("os.WriteFile(%q) failed: %v", src, err)
 	}
-	other := dir + "/other"
-	if err := os.WriteFile(other, nil, 0644); err != nil {
-		t.Fatalf("os.WriteFile(%q) failed: %v", other, err)
+	missing := filepath.Join(dir, "missing")
+	dst := filepath.Join(dir, "dst-dangling")
+	if err := os.Symlink(missing, dst); err != nil {
+		t.Fatalf("os.Symlink() failed: %v", err)
 	}
-	missing := dir + "/missing"
-	for _, tc := range []struct {
-		name    string
-		target  string
-		wantErr string
-	}{
-		{name: "dangling", target: missing, wantErr: "failed to safely mount: Open("},
-		{name: "live", target: other, wantErr: "expected to open"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dst := dir + "/dst-" + tc.name
-			if err := os.Symlink(tc.target, dst); err != nil {
-				t.Fatalf("os.Symlink() failed: %v", err)
-			}
-			// The destination check must fail before mount(2) runs.
-			err := SafeSetupAndMount(src, dst, "bind", unix.MS_BIND, "")
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("SafeSetupAndMount(%q -> %q) err = %v, want %q", dst, tc.target, err, tc.wantErr)
-			}
-			if _, err := os.Lstat(missing); !os.IsNotExist(err) {
-				t.Errorf("os.Lstat(%q) err = %v, want not exist", missing, err)
-			}
-		})
+	if err := SafeSetupAndMount(src, dst, "bind", unix.MS_BIND, ""); err == nil {
+		t.Errorf("SafeSetupAndMount(%q -> %q) unexpectedly succeeded", dst, missing)
+	} else if errors.Is(err, unix.ENOSYS) {
+		t.Fatalf("SafeSetupAndMount(%q -> %q) failed with ENOSYS: %v", dst, missing, err)
+	}
+	if _, err := os.Lstat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("os.Lstat(%q) err = %v, want %v", missing, err, os.ErrNotExist)
 	}
 }
