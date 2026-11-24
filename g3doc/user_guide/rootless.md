@@ -50,8 +50,7 @@ standard "rootful" code paths.
 *   Save/restore functionality is not supported.
 *   Outbound IPv4 sandbox networking (Netstack) requires `passt`
     (`/usr/bin/passt` or `--passt-binary`). Without `passt`, use
-    `--network=host` or `--network=none`. `runsc do` does not use `passt`: it
-    switches sandbox networking to host networking.
+    `--network=host` or `--network=none`.
 *   Configuration errors related to cgroups are ignored.
 
 ### Method 2: Caller-Configured Userns (Docker / Podman)

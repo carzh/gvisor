@@ -19,8 +19,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +33,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
@@ -53,6 +56,8 @@ type Do struct {
 	uidMap  idMapSlice
 	gidMap  idMapSlice
 	volumes volumes
+	out     io.Writer
+	errOut  io.Writer
 
 	// cached values for FetchSpec().
 	spec *specs.Spec
@@ -150,7 +155,7 @@ func (c *Do) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.cwd, "cwd", ".", "path to the current directory, defaults to the current directory")
 	f.StringVar(&c.erofs, "erofs", "", "path to the erofs root image")
 	f.StringVar(&c.ip, "ip", "192.168.10.2", "IPv4 address for the sandbox")
-	f.BoolVar(&c.quiet, "quiet", false, "suppress runsc messages to stdout. Application output is still sent to stdout and stderr")
+	f.BoolVar(&c.quiet, "quiet", false, "suppress runsc messages. Application output is still sent to stdout and stderr")
 	f.BoolVar(&c.overlay, "force-overlay", true, "use an overlay. WARNING: disabling gives the command write access to the host")
 	f.Var(&c.uidMap, "uid-map", "Add a user id mapping [ContainerID, HostID, Size]")
 	f.Var(&c.gidMap, "gid-map", "Add a group id mapping [ContainerID, HostID, Size]")
@@ -253,10 +258,11 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommand
 	if conf.Network == config.NetworkNone {
 		addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
 	} else if conf.Rootless {
-		if conf.Network == config.NetworkSandbox {
-			c.notifyUser("*** Warning: sandbox network isn't supported with --rootless, switching to host ***")
-			conf.Network = config.NetworkHost
+		clean, err := c.setupRootlessNet(conf, 0, spec, readHostResolvConf)
+		if err != nil {
+			return util.Errorf("Error setting up rootless network: %v", err)
 		}
+		defer clean()
 	} else {
 		switch clean, err := c.setupNet(cid, spec); err {
 		case errNoDefaultInterface:
@@ -283,9 +289,250 @@ func addNamespace(spec *specs.Spec, ns specs.LinuxNamespace) {
 	spec.Linux.Namespaces = append(spec.Linux.Namespaces, ns)
 }
 
+const maxResolvConfBytes = 64 << 10
+
+var passtSandboxIPv4 = [4]byte{10, 0, 2, 15}
+
+// readHostResolvConf reads up to maxResolvConfBytes from /etc/resolv.conf if it
+// is a regular file, returning "" on error.
+func readHostResolvConf() string {
+	f, err := os.OpenFile("/etc/resolv.conf", os.O_RDONLY|unix.O_NOCTTY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return ""
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxResolvConfBytes))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func hasResolvConfMount(spec *specs.Spec) bool {
+	for _, m := range spec.Mounts {
+		clean := filepath.Clean(m.Destination)
+		if clean == "/etc" || clean == "/etc/resolv.conf" || strings.HasPrefix(clean, "/etc/resolv.conf/") {
+			return true
+		}
+	}
+	return false
+}
+
+// setupRootlessNet configures rootless sandbox networking on conf and spec. It
+// returns a cleanup function that removes any temporary files mounted into
+// spec.
+func (c *Do) setupRootlessNet(conf *config.Config, euid int, spec *specs.Spec, readResolvConf func() string) (func(), error) {
+	if conf.Network != config.NetworkSandbox {
+		return func() {}, nil
+	}
+	if passtBin := conf.ResolvePasstBinary(euid); passtBin != "" {
+		c.notifyInfo("*** Using passt (%s) for rootless sandbox networking ***", passtBin)
+		// passt and netgofer give the sandbox its network. The sandbox
+		// gets a new, empty network namespace.
+		addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+		if hasResolvConfMount(spec) {
+			return func() {}, nil
+		}
+		if c.erofs != "" {
+			// The image cannot get a new mount point if its /etc/resolv.conf
+			// is a dangling symlink, so keep the image file.
+			log.Infof("Skipping /etc/resolv.conf mount in passt mode: --erofs images keep their own /etc/resolv.conf")
+			return func() {}, nil
+		}
+		if spec.Root != nil && spec.Root.Path != "" {
+			resolved, err := sandboxsetup.ResolveSymlinks(spec.Root.Path, "/etc/resolv.conf")
+			if err != nil {
+				log.Warningf("Skipping /etc/resolv.conf mount in passt mode: resolving /etc/resolv.conf in %q: %v", spec.Root.Path, err)
+				return func() {}, nil
+			}
+			if fi, err := os.Lstat(resolved); err != nil || !fi.Mode().IsRegular() {
+				log.Warningf("Skipping /etc/resolv.conf mount in passt mode: %q is not an existing regular file (%v)", resolved, err)
+				return func() {}, nil
+			}
+		}
+		var hostResolvConf string
+		if readResolvConf != nil {
+			hostResolvConf = readResolvConf()
+		}
+		return mountPrivateReadonlyFile("/etc/resolv.conf", passtResolvConf(hostResolvConf, readHostIPv4Addrs), spec)
+	}
+	if conf.UseNetworkProxy() || conf.XDP.Mode != config.XDPModeOff {
+		c.notifyUser("*** Warning: sandbox network with --rootless requires passt and is incompatible with --netgofer, --network-proxy-path, and XDP, switching to host ***")
+	} else {
+		c.notifyUser("*** Warning: sandbox network with --rootless requires passt (https://passt.top) at %s or --passt-binary, switching to host ***", config.DefaultPasstBinary)
+	}
+	conf.Network = config.NetworkHost
+	return func() {}, nil
+}
+
+func hasControlChars(s string) bool {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if (b < 0x20 && b != '\t') || b == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// readHostIPv4Addrs returns the IPv4 addresses of the host network
+// interfaces, or nil on error.
+func readHostIPv4Addrs() map[[4]byte]struct{} {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Warningf("Failed to read host interface addresses for resolv.conf filtering: %v", err)
+		return nil
+	}
+	m := make(map[[4]byte]struct{}, len(addrs))
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			m[[4]byte(ip4)] = struct{}{}
+		}
+	}
+	return m
+}
+
+// passtNameserverCandidate reports whether ip4 can be a sandbox nameserver in
+// passt mode. The netgofer egress filter drops traffic to the addresses that
+// it rejects. Host interface addresses are checked separately.
+func passtNameserverCandidate(ip4 [4]byte) bool {
+	if ip4 == passtSandboxIPv4 || ip4[0] == 0 || ip4 == [4]byte{255, 255, 255, 255} {
+		return false
+	}
+	addr := netip.AddrFrom4(ip4)
+	return !addr.IsLoopback() && !addr.IsLinkLocalUnicast() && !addr.IsMulticast()
+}
+
+// passtResolvConf builds /etc/resolv.conf contents for passt mode from
+// hostResolvConf. It keeps IPv4 nameservers that the netgofer egress filter
+// allows (plus search, domain, and options lines), or falls back to 8.8.8.8
+// without host search or domain suffixes when no nameserver remains.
+// readHostAddrs returns the host interface addresses, which the egress filter
+// blocks. passtResolvConf calls it at most once, and only for a candidate
+// nameserver.
+func passtResolvConf(hostResolvConf string, readHostAddrs func() map[[4]byte]struct{}) string {
+	var (
+		hostAddrs     map[[4]byte]struct{}
+		hostAddrsRead bool
+	)
+	var nameservers []string
+	var searchLines []string
+	var optionLines []string
+	for line := range strings.SplitSeq(hostResolvConf, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if idx := strings.IndexAny(line, "#;"); idx >= 0 {
+			line = line[:idx]
+		}
+		if hasControlChars(line) {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		sep := strings.IndexAny(trimmed, " \t")
+		if sep < 0 {
+			continue
+		}
+		directive := trimmed[:sep]
+		rest := strings.TrimSpace(trimmed[sep+1:])
+		if rest == "" {
+			continue
+		}
+		switch directive {
+		case "nameserver":
+			token := rest
+			if end := strings.IndexAny(rest, " \t"); end >= 0 {
+				token = rest[:end]
+			}
+			addr, err := netip.ParseAddr(token)
+			if err != nil {
+				continue
+			}
+			addr = addr.Unmap()
+			if !addr.Is4() {
+				continue
+			}
+			ip4 := addr.As4()
+			if !passtNameserverCandidate(ip4) {
+				continue
+			}
+			if !hostAddrsRead {
+				hostAddrsRead = true
+				if readHostAddrs != nil {
+					hostAddrs = readHostAddrs()
+				}
+			}
+			if _, ok := hostAddrs[ip4]; ok {
+				continue
+			}
+			if nameservers == nil {
+				nameservers = make([]string, 0, 3)
+			}
+			nameservers = append(nameservers, "nameserver "+addr.String())
+		case "search", "domain":
+			searchLines = append(searchLines, directive+" "+strings.Join(strings.Fields(rest), " "))
+		case "options":
+			optionLines = append(optionLines, "options "+strings.Join(strings.Fields(rest), " "))
+		}
+	}
+	if len(nameservers) == 0 {
+		if len(optionLines) == 0 {
+			return "nameserver 8.8.8.8\n"
+		}
+		var b strings.Builder
+		b.WriteString("nameserver 8.8.8.8\n")
+		for _, opt := range optionLines {
+			b.WriteString(opt)
+			b.WriteByte('\n')
+		}
+		return b.String()
+	}
+	var b strings.Builder
+	for _, ns := range nameservers {
+		b.WriteString(ns)
+		b.WriteByte('\n')
+	}
+	for _, s := range searchLines {
+		b.WriteString(s)
+		b.WriteByte('\n')
+	}
+	for _, opt := range optionLines {
+		b.WriteString(opt)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func (c *Do) notifyInfo(format string, v ...any) {
+	if !c.quiet {
+		w := c.errOut
+		if w == nil {
+			w = os.Stderr
+		}
+		fmt.Fprintf(w, format+"\n", v...)
+	}
+	log.Infof(format, v...)
+}
+
 func (c *Do) notifyUser(format string, v ...any) {
 	if !c.quiet {
-		fmt.Printf(format+"\n", v...)
+		w := c.out
+		if w == nil {
+			w = os.Stdout
+		}
+		fmt.Fprintf(w, format+"\n", v...)
 	}
 	log.Warningf(format, v...)
 }
@@ -438,15 +685,62 @@ func deviceMTU(dev string) (int, error) {
 	return intf.MTU, nil
 }
 
+func mountPrivateReadonlyFile(dest, content string, spec *specs.Spec) (func(), error) {
+	tmpDir, err := os.MkdirTemp("", "runsc-do-net-")
+	if err != nil {
+		return nil, err
+	}
+	clean := func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			log.Warningf("Failed to remove %q: %v", tmpDir, err)
+		}
+	}
+	src := filepath.Join(tmpDir, filepath.Base(dest))
+	f, err := os.OpenFile(src, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		clean()
+		return nil, err
+	}
+	if err := f.Chmod(0644); err != nil {
+		_ = f.Close()
+		clean()
+		return nil, err
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		clean()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		clean()
+		return nil, err
+	}
+	spec.Mounts = append(spec.Mounts, specs.Mount{
+		Source:      src,
+		Destination: dest,
+		Type:        "bind",
+		Options:     []string{"ro", "nosuid", "nodev", "noexec"},
+	})
+	return clean, nil
+}
+
 func makeFile(dest, content string, spec *specs.Spec) (string, error) {
 	tmpFile, err := os.CreateTemp("", filepath.Base(dest))
 	if err != nil {
 		return "", err
 	}
+	if err := tmpFile.Chmod(0644); err != nil {
+		_ = tmpFile.Close()
+		tryRemove(tmpFile.Name())
+		return "", err
+	}
 	if _, err := tmpFile.WriteString(content); err != nil {
-		if err := os.Remove(tmpFile.Name()); err != nil {
-			log.Warningf("Failed to remove %q: %v", tmpFile.Name(), err)
-		}
+		_ = tmpFile.Close()
+		tryRemove(tmpFile.Name())
+		return "", err
+	}
+	if err := tmpFile.Close(); err != nil {
+		tryRemove(tmpFile.Name())
 		return "", err
 	}
 	spec.Mounts = append(spec.Mounts, specs.Mount{
