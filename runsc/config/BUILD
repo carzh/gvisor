@@ -24,6 +24,7 @@ go_library(
         "//pkg/sync",
         "//runsc/flag",
         "//runsc/version",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
