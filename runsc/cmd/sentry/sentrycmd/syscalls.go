@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/runsc/cmd/sentry/forwardcmd"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // Syscalls implements subcommands.Command for the "syscalls" command.
@@ -97,10 +98,12 @@ func (s *Syscalls) Execute(context.Context, *flag.FlagSet, ...any) subcommands.E
 
 	w := os.Stdout // Default.
 	if s.Filename != "" {
-		w, err = os.OpenFile(s.Filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(s.Filename, 0644)
 		if err != nil {
 			util.Fatalf("Error opening %q: %v", s.Filename, err)
 		}
+		defer f.Close()
+		w = f
 	}
 	if err := out(w, info); err != nil {
 		util.Fatalf("Error writing output: %v", err)
