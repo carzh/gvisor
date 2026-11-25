@@ -34,6 +34,7 @@ go_test(
     size = "small",
     srcs = [
         "bug_test.go",
+        "file_test.go",
         "json_test.go",
         "log_test.go",
     ],

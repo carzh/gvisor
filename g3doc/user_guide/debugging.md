@@ -60,6 +60,7 @@ As of writing, the supported flags include:
 *   `--profiling-metrics-log`
 *   `--user-log`
 *   `--final-metrics-log`
+*   `--boot-times-log`
 *   `--pod-init-config`
 *   `--profile-block`
 *   `--profile-cpu`
@@ -77,6 +78,11 @@ with names providing the sandbox ID and command, like
 > separation per command. If a file path is used without variables (e.g.,
 > `%ID%`), output from multiple commands or sandboxes will be concurrently
 > written to the same file, causing logs to be clobbered.
+
+> Note: For the runtime flags `--final-metrics-log`, `--boot-times-log`,
+> `--profile-block`, `--profile-cpu`, `--profile-heap`, `--profile-mutex`, and
+> `--trace`, the final component of the resolved file path cannot be a symlink,
+> and any existing destination must be a regular file with a single hard link.
 
 ## Stack traces
 

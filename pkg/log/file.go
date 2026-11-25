@@ -38,23 +38,45 @@ func (f *DefaultFileOpts) Build(logPattern string) string {
 // OpenFile opens a log file using the specified flags. It uses `opts` to
 // construct the log file path based on the given `logPattern`.
 func OpenFile(logPattern string, flags int, opts FileOpts) (*os.File, error) {
+	return PrepareAndOpenFile(logPattern, opts, nil, func(logPath string, perm os.FileMode) (*os.File, error) {
+		return os.OpenFile(logPath, flags, perm)
+	})
+}
+
+// PrepareAndOpenFile constructs the log file path from `logPattern` using
+// `opts` (defaulting to DefaultFileOpts if nil), runs `validate` (if non-nil)
+// before creating missing parent directories with mode 0755, and opens the
+// file using `open` with mode 0644. It returns (nil, nil) if `logPattern` is
+// empty.
+func PrepareAndOpenFile(logPattern string, opts FileOpts, validate func(logPath string) error, open func(logPath string, perm os.FileMode) (*os.File, error)) (*os.File, error) {
 	if len(logPattern) == 0 {
 		return nil, nil
+	}
+	if opts == nil {
+		opts = &DefaultFileOpts{}
+	}
+	if open == nil {
+		return nil, fmt.Errorf("error opening file %q: nil open function", logPattern)
 	}
 
 	// Replace variables in the log pattern.
 	logPath := opts.Build(logPattern)
+	if validate != nil {
+		if err := validate(logPath); err != nil {
+			return nil, fmt.Errorf("error opening file %q: %w", logPath, err)
+		}
+	}
 
 	// Create parent directory if it doesn't exist.
 	dir := filepath.Dir(logPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("error creating dir %q: %v", dir, err)
+		return nil, fmt.Errorf("error creating dir %q: %w", dir, err)
 	}
 
-	// Open file with the specified flags.
-	f, err := os.OpenFile(logPath, flags, 0644)
+	// Open file with mode 0644.
+	f, err := open(logPath, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("error opening file %q: %v", logPath, err)
+		return nil, fmt.Errorf("error opening file %q: %w", logPath, err)
 	}
 	return f, nil
 }
