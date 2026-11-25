@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // cpu implements subcommands.Command for the "cpu" command.
@@ -81,7 +82,7 @@ func (c *cpu) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
 
 	out := os.Stdout
 	if c.output != "" {
-		f, err := os.OpenFile(c.output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(c.output, 0644)
 		if err != nil {
 			util.Fatalf("failed to open output file: %v", err)
 		}

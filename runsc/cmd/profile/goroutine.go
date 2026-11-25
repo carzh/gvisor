@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // goroutine implements subcommands.Command for the "goroutine" command.
@@ -78,7 +79,7 @@ func (g *goroutine) Execute(_ context.Context, f *flag.FlagSet, args ...any) sub
 
 	out := os.Stdout
 	if g.output != "" {
-		f, err := os.OpenFile(g.output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(g.output, 0644)
 		if err != nil {
 			util.Fatalf("failed to open output file: %v", err)
 		}

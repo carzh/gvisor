@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // trace implements subcommands.Command for the "trace" command.
@@ -81,7 +82,7 @@ func (t *trace) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 
 	out := os.Stdout
 	if t.output != "" {
-		f, err := os.OpenFile(t.output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(t.output, 0644)
 		if err != nil {
 			util.Fatalf("failed to open output file: %v", err)
 		}
