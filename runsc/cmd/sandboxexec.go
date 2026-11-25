@@ -142,7 +142,7 @@ func (c *SandboxExec) Execute(_ context.Context, f *flag.FlagSet, args ...any) s
 
 	passFiles := make(map[int]*os.File)
 	if opts.GetStdoutFile() != "" {
-		f, err := os.OpenFile(opts.GetStdoutFile(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(opts.GetStdoutFile(), 0644)
 		if err != nil {
 			return util.Errorf("opening stdout file: %v", err)
 		}
@@ -153,7 +153,7 @@ func (c *SandboxExec) Execute(_ context.Context, f *flag.FlagSet, args ...any) s
 	}
 
 	if opts.GetStderrFile() != "" {
-		f, err := os.OpenFile(opts.GetStderrFile(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(opts.GetStderrFile(), 0644)
 		if err != nil {
 			return util.Errorf("opening stderr file: %v", err)
 		}
