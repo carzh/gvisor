@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 // Debug implements subcommands.Command for the "debug" command.
@@ -269,7 +270,7 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		traceFile *os.File
 	)
 	if d.profileBlock != "" {
-		f, err := os.OpenFile(d.profileBlock, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(d.profileBlock, 0644)
 		if err != nil {
 			return util.Errorf("error opening blocking profile output: %v", err)
 		}
@@ -277,7 +278,7 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		blockFile = f
 	}
 	if d.profileCPU != "" {
-		f, err := os.OpenFile(d.profileCPU, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(d.profileCPU, 0644)
 		if err != nil {
 			return util.Errorf("error opening cpu profile output: %v", err)
 		}
@@ -285,7 +286,7 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		cpuFile = f
 	}
 	if d.profileHeap != "" {
-		f, err := os.OpenFile(d.profileHeap, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(d.profileHeap, 0644)
 		if err != nil {
 			return util.Errorf("error opening heap profile output: %v", err)
 		}
@@ -293,7 +294,7 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		heapFile = f
 	}
 	if d.profileMutex != "" {
-		f, err := os.OpenFile(d.profileMutex, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(d.profileMutex, 0644)
 		if err != nil {
 			return util.Errorf("error opening mutex profile output: %v", err)
 		}
@@ -301,10 +302,11 @@ func (d *Debug) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		mutexFile = f
 	}
 	if d.trace != "" {
-		f, err := os.OpenFile(d.trace, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := specutils.OpenAndTruncateRegularFile(d.trace, 0644)
 		if err != nil {
 			return util.Errorf("error opening trace profile output: %v", err)
 		}
+		defer f.Close()
 		traceFile = f
 	}
 
