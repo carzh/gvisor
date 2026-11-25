@@ -21,7 +21,6 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -105,11 +104,10 @@ func (r *RootfsUpper) SetFlags(f *flag.FlagSet) {
 }
 
 func openOutputTarFile(path string) (*os.File, error) {
-	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-	if !specutils.IsProcFDPath(path) {
-		flags |= unix.O_NOFOLLOW
+	if specutils.IsProcFDPath(path) {
+		return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	}
-	return os.OpenFile(path, flags, 0644)
+	return specutils.OpenAndTruncateRegularFile(path, 0644)
 }
 
 // Execute implements subcommands.Command.
